@@ -18,8 +18,8 @@ import HeightIcon from '@mui/icons-material/Height';
 import {MythicChip} from "../../MythicComponents/MythicChip";
 
 const subResponsesQuery = gql`
-subscription subResponsesQuery($task_id: Int!) {
-  response_stream(where: {task_id: {_eq: $task_id}}, batch_size: 50, cursor: {initial_value: {id: 0}}) {
+subscription subResponsesQuery($task_id: Int!, $cursor_id: Int!) {
+  response_stream(where: {task_id: {_eq: $task_id}}, batch_size: 50, cursor: {initial_value: {id: $cursor_id}}) {
     id
     response: response_text
     timestamp
@@ -43,7 +43,22 @@ query getInteractiveResponsesPage($task_id: Int!, $fetchLimit: Int!, $offset: In
     id
   }
 }`;
+const getInteractiveLatestResponsesQuery = gql`
+query getInteractiveLatestResponses($task_id: Int!, $fetchLimit: Int!) {
+  response(where: {task_id: {_eq: $task_id}}, limit: $fetchLimit, order_by: {id: desc}) {
+    id
+    response: response_text
+    timestamp
+    is_error
+  }
+  response_aggregate(where: {task_id: {_eq: $task_id}}) {
+    aggregate {
+      count
+    }
+  }
+}`;
 const MAX_INTERACTIVE_SELECT_ALL_RESPONSES = 5000;
+const INTERACTIVE_LIVE_WINDOW_SIZE = 100;
 const getInteractiveResponseWhereClause = (taskID, search) => {
     if(search === undefined || search === ""){
         return {task_id: {_eq: taskID}};
@@ -99,6 +114,26 @@ export const getInteractiveTerminalTheme = (theme) => {
         cursor: theme.palette.info.main,
         selectionBackground: theme.palette.info.main + "55",
     }
+}
+export const getInteractiveTerminalAppendIndex = (previousSignatures, nextSignatures) => {
+    if(previousSignatures.length === 0){
+        return 0;
+    }
+    const lastIndex = nextSignatures.lastIndexOf(previousSignatures[previousSignatures.length - 1]);
+    if(lastIndex < 0){
+        return -1;
+    }
+    const overlapLength = lastIndex + 1;
+    if(overlapLength > previousSignatures.length){
+        return -1;
+    }
+    const previousOffset = previousSignatures.length - overlapLength;
+    for(let i = 0; i < overlapLength; i++){
+        if(previousSignatures[previousOffset + i] !== nextSignatures[i]){
+            return -1;
+        }
+    }
+    return overlapLength;
 }
 const getInteractiveTerminalEntrySignature = (entry) => {
     if(entry.response !== undefined){
@@ -170,6 +205,7 @@ const InteractiveTerminalDisplay = ({
     onTerminalInput,
     onTerminalKeyEvent,
     onTerminalResize,
+    onScreenModeChange,
 }) => {
     const terminalScrollContainerRef = React.useRef(null);
     const terminalElementRef = React.useRef(null);
@@ -187,11 +223,12 @@ const InteractiveTerminalDisplay = ({
     const onTerminalInputRef = React.useRef(onTerminalInput);
     const onTerminalKeyEventRef = React.useRef(onTerminalKeyEvent);
     const onTerminalResizeRef = React.useRef(onTerminalResize);
+    const onScreenModeChangeRef = React.useRef(onScreenModeChange);
     const unwrappedColumnCountRef = React.useRef(0);
     const [terminalReady, setTerminalReady] = React.useState(false);
     const longestLineLength = React.useMemo( () => {
-        return getLongestInteractiveTerminalLineLength(data);
-    }, [data]);
+        return wrapText ? 0 : getLongestInteractiveTerminalLineLength(data);
+    }, [data, wrapText]);
     const fitTerminal = React.useCallback( () => {
         const terminal = terminalRef.current;
         const fitAddon = fitAddonRef.current;
@@ -208,7 +245,7 @@ const InteractiveTerminalDisplay = ({
             }
             const rows = Math.max(1, proposedDimensions.rows);
             const visibleCols = Math.max(1, proposedDimensions.cols);
-            if(wrapTextRef.current){
+            if(wrapTextRef.current || terminal.buffer.active.type === "alternate"){
                 fitAddon.fit();
                 scrollContainer.scrollLeft = 0;
             } else {
@@ -285,6 +322,9 @@ const InteractiveTerminalDisplay = ({
         onTerminalResizeRef.current = onTerminalResize;
     }, [onTerminalResize]);
     React.useEffect( () => {
+        onScreenModeChangeRef.current = onScreenModeChange;
+    }, [onScreenModeChange]);
+    React.useEffect( () => {
         if(wrapText){
             unwrappedColumnCountRef.current = 0;
         } else {
@@ -309,6 +349,11 @@ const InteractiveTerminalDisplay = ({
         });
         const keyDisposable = terminal.onKey(({key}) => {
             writeLocalTerminalAction(onTerminalInputRef.current?.(key));
+        });
+        // alternate screen buffer (ESC[?1049h etc) means a full-screen app is running
+        const bufferChangeDisposable = terminal.buffer.onBufferChange((buffer) => {
+            onScreenModeChangeRef.current?.(buffer.type === "alternate");
+            scheduleFitTerminal();
         });
         const handleTerminalPaste = (event) => {
             if(!canSendInputRef.current){
@@ -361,6 +406,7 @@ const InteractiveTerminalDisplay = ({
             terminalRef.current = null;
             terminalElement.removeEventListener("paste", handleTerminalPaste);
             keyDisposable.dispose();
+            bufferChangeDisposable.dispose();
             terminal.dispose();
         }
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -376,17 +422,20 @@ const InteractiveTerminalDisplay = ({
         const terminal = terminalRef.current;
         scheduleFitTerminal();
         const nextSignatures = data.map(getInteractiveTerminalEntrySignature);
-        const settingsKey = `${useASNIColor}:${showTaskStatus}:${wrapText}:${inputMode}`;
+        const settingsKey = `${useASNIColor}:${showTaskStatus}:${wrapText}`;
         const previousReplayState = replayStateRef.current;
         const hasPendingLineInput = canSendInputRef.current &&
             inputModeRef.current === "line" &&
             lineInputBufferRef.current.length > 0;
+        // only replay on input mode change to clear local echo, otherwise a full-screen app is wiped
+        const inputModeNeedsReset = previousReplayState.inputMode !== inputMode && localEchoVisibleRef.current;
+        const appendFromIndex = getInteractiveTerminalAppendIndex(previousReplayState.signatures, nextSignatures);
         const canAppend = !hasPendingLineInput &&
+            !inputModeNeedsReset &&
             previousReplayState.settingsKey === settingsKey &&
-            nextSignatures.length >= previousReplayState.signatures.length &&
-            previousReplayState.signatures.every((signature, index) => signature === nextSignatures[index]);
+            appendFromIndex >= 0;
         const previousViewportY = terminal.buffer.active.viewportY;
-        const entriesToWrite = canAppend ? data.slice(previousReplayState.signatures.length) : data;
+        const entriesToWrite = canAppend ? data.slice(appendFromIndex) : data;
         if(!canAppend){
             terminal.reset();
         }
@@ -397,6 +446,7 @@ const InteractiveTerminalDisplay = ({
         });
         replayStateRef.current = {
             settingsKey,
+            inputMode,
             signatures: nextSignatures,
         };
         const afterWrite = () => {
@@ -565,6 +615,17 @@ export const ResponseDisplayInteractive = (props) =>{
     const [lineInputBuffer, setLineInputBuffer] = React.useState("");
     const [selectedEnterOption, setSelectedEnterOption] = React.useState(1);
     const [pendingInputEvents, setPendingInputEvents] = React.useState([]);
+    const [followLive, setFollowLive] = React.useState(true);
+    const isLive = followLive && search === "";
+    const isLiveRef = React.useRef(isLive);
+    isLiveRef.current = isLive;
+    const liveWindowSize = props.selectAllOutput ? MAX_INTERACTIVE_SELECT_ALL_RESPONSES : INTERACTIVE_LIVE_WINDOW_SIZE;
+    const liveWindowSizeRef = React.useRef(liveWindowSize);
+    liveWindowSizeRef.current = liveWindowSize;
+    const [screenAlternate, setScreenAlternate] = React.useState(false);
+    const tuiActive = screenAlternate && isLive;
+    const inputModeBeforeTuiRef = React.useRef(null);
+    const [streamCursorID, setStreamCursorID] = React.useState(null);
     const setTrackedTotalCount = React.useCallback( (newTotalCount) => {
         totalCountRef.current = newTotalCount;
         setTotalCount(newTotalCount);
@@ -648,6 +709,7 @@ export const ResponseDisplayInteractive = (props) =>{
             setTrackedTotalCount(aggregateCount);
             const latestResponseID = getInteractiveLatestResponseID(data);
             highestFetched.current = Math.max(highestFetched.current, aggregateCount > 0 ? latestResponseID : 0);
+            setStreamCursorID((current) => current === null ? highestFetched.current : current);
             if(props.selectAllOutput){
                 warnSelectAllCapped(nextResponses.length, aggregateCount);
             }
@@ -656,9 +718,44 @@ export const ResponseDisplayInteractive = (props) =>{
         onError: data => {
             console.error(data);
             snackActions.error("Failed to fetch interactive responses: " + data.message);
+            setStreamCursorID((current) => current === null ? 0 : current);
             setBackdropOpen(false);
         }
     });
+    const [fetchLatestResponsesQuery] = useLazyQuery(getInteractiveLatestResponsesQuery, {
+        fetchPolicy: "no-cache",
+        onCompleted: (data) => {
+            const responseMap = new Map();
+            data.response.forEach((response) => responseMap.set(response.id, decodeInteractiveResponse(response)));
+            rawResponsesRef.current.forEach((response) => responseMap.set(response.id, response));
+            const nextResponses = Array.from(responseMap.values())
+                .sort((a,b) => a.id > b.id ? 1 : -1)
+                .slice(-liveWindowSizeRef.current);
+            rawResponsesRef.current = nextResponses;
+            setRawResponses(nextResponses);
+            if(nextResponses.length > 0){
+                setPendingInputEvents([]);
+            }
+            const latestResponseID = nextResponses.length > 0 ? nextResponses[nextResponses.length - 1].id : 0;
+            highestFetched.current = Math.max(highestFetched.current, latestResponseID);
+            setStreamCursorID((current) => current === null ? highestFetched.current : current);
+            setTrackedTotalCount(Math.max(getInteractiveAggregateCount(data), totalCountRef.current));
+            setBackdropOpen(false);
+        },
+        onError: data => {
+            console.error(data);
+            snackActions.error("Failed to fetch interactive responses: " + data.message);
+            setStreamCursorID((current) => current === null ? 0 : current);
+            setBackdropOpen(false);
+        }
+    });
+    const fetchLatestResponses = React.useCallback( () => {
+        setBackdropOpen(true);
+        fetchLatestResponsesQuery({variables: {
+            task_id: props.task.id,
+            fetchLimit: liveWindowSize,
+        }});
+    }, [fetchLatestResponsesQuery, liveWindowSize, props.task.id]);
     const fetchResponsePage = React.useCallback( (requestedPage=1, showBackdrop=true) => {
         const nextPage = props.selectAllOutput ? 1 : Math.max(1, requestedPage || 1);
         currentPageRef.current = nextPage;
@@ -682,11 +779,22 @@ export const ResponseDisplayInteractive = (props) =>{
         setTrackedTotalCount(0);
         taskResponseCountRef.current = props.task.response_count || 0;
         selectAllWarningShown.current = false;
+        setFollowLive(true);
+        setStreamCursorID(null);
     }, [props.task.id, setTrackedTotalCount]);
     React.useEffect( () => {
         selectAllWarningShown.current = false;
-        fetchResponsePage(1);
-    }, [fetchResponsePage]);
+        if(isLive){
+            rawResponsesRef.current = [];
+            setRawResponses([]);
+            fetchLatestResponses();
+        } else if(search !== ""){
+            fetchResponsePage(1);
+        }
+    }, [fetchResponsePage, fetchLatestResponses, isLive]); // eslint-disable-line react-hooks/exhaustive-deps
+    React.useEffect( () => {
+        setFollowLive(true);
+    }, [props.selectAllOutput]);
     const subscriptionDataCallback = React.useCallback( ({data}) => {
         const streamedResponses = data?.data?.response_stream || [];
         if(streamedResponses.length === 0){
@@ -712,6 +820,14 @@ export const ResponseDisplayInteractive = (props) =>{
         const nextTotalCount = previousTotalCount + newResponses.length;
         taskResponseCountRef.current = Math.max(taskResponseCountRef.current, nextTotalCount);
         setTrackedTotalCount(nextTotalCount);
+        if(isLiveRef.current){
+            const mergedResponses = [...rawResponsesRef.current, ...newResponses.map(decodeInteractiveResponse)]
+                .sort((a,b) => a.id > b.id ? 1 : -1)
+                .slice(-liveWindowSizeRef.current);
+            rawResponsesRef.current = mergedResponses;
+            setRawResponses(mergedResponses);
+            return;
+        }
         if(props.selectAllOutput){
             const previousResponses = rawResponsesRef.current;
             if(previousResponses.length >= MAX_INTERACTIVE_SELECT_ALL_RESPONSES){
@@ -753,16 +869,22 @@ export const ResponseDisplayInteractive = (props) =>{
         }
     }, [backdropOpen, fetchResponsePage, props.selectAllOutput, search, setTrackedTotalCount, warnSelectAllCapped]);
     useSubscription(subResponsesQuery, {
-        variables: {task_id: props.task.id},
+        variables: {task_id: props.task.id, cursor_id: streamCursorID || 0},
+        skip: streamCursorID === null,
         fetchPolicy: "no-cache",
         onData: subscriptionDataCallback
     });
     const onSubmitPageChange = (currentPage) => {
+        if(isLiveRef.current){
+            rawResponsesRef.current = [];
+            setFollowLive(false);
+        }
         fetchResponsePage(currentPage);
     }
     const onSubmitSearch = React.useCallback( (newSearch) => {
         currentPageRef.current = 1;
         setCurrentPage(1);
+        setFollowLive(true);
         setSearch(newSearch || "");
     }, []);
     React.useEffect( () => {
@@ -772,7 +894,7 @@ export const ResponseDisplayInteractive = (props) =>{
         if(search === ""){
             setTrackedTotalCount(nextResponseCount);
         }
-        if(search !== "" || nextResponseCount <= previousKnownResponseCount){
+        if(isLiveRef.current || search !== "" || nextResponseCount <= previousKnownResponseCount){
             return;
         }
         const pageStartIndex = (currentPageRef.current - 1) * pageSize.current;
@@ -993,6 +1115,21 @@ export const ResponseDisplayInteractive = (props) =>{
         }
         setInputMode(value);
     };
+    React.useEffect( () => {
+        if(!canSendTerminalInput){
+            return;
+        }
+        if(tuiActive && inputMode !== "raw" && inputModeBeforeTuiRef.current === null){
+            inputModeBeforeTuiRef.current = inputMode;
+            onChangeInputMode("raw");
+        } else if(!tuiActive && inputModeBeforeTuiRef.current !== null){
+            const previousInputMode = inputModeBeforeTuiRef.current;
+            inputModeBeforeTuiRef.current = null;
+            if(inputMode === "raw"){
+                onChangeInputMode(previousInputMode);
+            }
+        }
+    }, [tuiActive]); // eslint-disable-line react-hooks/exhaustive-deps
     const onChangeSelectEnterOption = (value) => {
         setSelectedEnterOption(value);
     };
@@ -1052,6 +1189,7 @@ export const ResponseDisplayInteractive = (props) =>{
                       toggleWrapText={toggleWrapText}
                       autoScroll={autoScroll}
                       toggleAutoScroll={toggleAutoScroll}
+                      tuiActive={tuiActive}
                   />
               }
               <div style={{overflow: "hidden", width: "100%", marginBottom: "5px", height: props.expand ? "100%": undefined,
@@ -1067,13 +1205,16 @@ export const ResponseDisplayInteractive = (props) =>{
                                               lineInputBuffer={lineInputBuffer}
                                               onTerminalInput={handleTerminalData}
                                               onTerminalKeyEvent={handleTerminalKeyEvent}
-                                              onTerminalResize={sendTerminalResize}/>
+                                              onTerminalResize={sendTerminalResize}
+                                              onScreenModeChange={setScreenAlternate}/>
               </div>
           </div>
 
           <InteractivePaginationBar totalCount={totalCount} currentPage={currentPage}
                                     onSubmitPageChange={onSubmitPageChange} expand={props.expand}
-                                    pageSize={pageSize.current} selectAllOutput={props.selectAllOutput}/>
+                                    pageSize={pageSize.current} selectAllOutput={props.selectAllOutput}
+                                    isLive={isLive} canJumpToLive={!followLive && search === ""}
+                                    onJumpToLive={() => setFollowLive(true)} tuiActive={tuiActive}/>
       </div>
   )
 
@@ -1091,6 +1232,7 @@ const InteractiveTerminalToolbar = ({
     toggleWrapText,
     autoScroll,
     toggleAutoScroll,
+    tuiActive,
 }) => {
     const [enterAnchorEl, setEnterAnchorEl] = React.useState(null);
     const selectedEnter = EnterOptions[selectedEnterOption] || EnterOptions[0];
@@ -1133,6 +1275,11 @@ const InteractiveTerminalToolbar = ({
                         </MenuItem>
                     ))}
                 </Menu>
+                {tuiActive &&
+                    <MythicStyledTooltip title="A full-screen terminal app is running. Showing live output only; pagination returns when it exits.">
+                        <MythicChip compact label="Full-screen app" tone="info" />
+                    </MythicStyledTooltip>
+                }
                 {pendingInputEvents.length > 0 &&
                     <div className="mythic-interactive-terminal-pending text-output-muted items-center flex gap-2 min-w-0 overflow-hidden whitespace-nowrap">
                         <span>Awaiting output</span>
@@ -1143,18 +1290,20 @@ const InteractiveTerminalToolbar = ({
                 }
                 <div className="mythic-interactive-terminal-toolbar-spacer flex-fill min-w-0" />
                 <div className="mythic-interactive-terminal-toggle-group bg-output-control border-output items-center inline-flex flex-none overflow-hidden rounded" role="group" aria-label="Terminal display options">
-                    <MythicStyledTooltip title={useASNIColor ?  "Disable ANSI Color" : "Enable ANSI Color"} >
+                    <MythicStyledTooltip title={tuiActive ? "Unavailable while a full-screen app is running" : useASNIColor ?  "Disable ANSI Color" : "Enable ANSI Color"} >
                         <button
                             aria-pressed={useASNIColor}
+                            disabled={tuiActive}
                             className={`mythic-interactive-terminal-toggle-button bg-transparent border-none text-output-muted items-center inline-flex flex-none justify-center cursor-pointer${useASNIColor ? "" : " mythic-action-tone mythic-tone-warning"}`}
                             onClick={toggleANSIColor}
                             type="button">
                             <PaletteIcon fontSize="small" />
                         </button>
                     </MythicStyledTooltip>
-                    <MythicStyledTooltip title={wrapText ?  "Unwrap Text" : "Wrap Text"} >
+                    <MythicStyledTooltip title={tuiActive ? "Unavailable while a full-screen app is running" : wrapText ?  "Unwrap Text" : "Wrap Text"} >
                         <button
                             aria-pressed={wrapText}
+                            disabled={tuiActive}
                             className={`mythic-interactive-terminal-toggle-button bg-transparent border-none text-output-muted items-center inline-flex flex-none justify-center cursor-pointer${wrapText ? "" : " mythic-action-tone mythic-tone-warning"}`}
                             onClick={toggleWrapText}
                             type="button">
@@ -1180,20 +1329,25 @@ const InteractiveTerminalToolbar = ({
         </div>
     )
 }
-const InteractivePaginationBar = ({totalCount, currentPage, onSubmitPageChange, pageSize, selectAllOutput}) => {
+const InteractivePaginationBar = ({totalCount, currentPage, onSubmitPageChange, pageSize, selectAllOutput,
+                                      isLive, canJumpToLive, onJumpToLive, tuiActive}) => {
     const onChangePage =  (event, value) => {
         onSubmitPageChange(value);
     };
     const pageCount = Math.max(1, Math.ceil(totalCount / pageSize));
-    if(pageCount < 2 || selectAllOutput){
+    if(tuiActive || selectAllOutput || (pageCount < 2 && !canJumpToLive)){
         return null;
     }
     return (
         <div style={{background: "transparent", display: "flex", justifyContent: "center", alignItems: "center"}} >
-            <Pagination count={pageCount} page={currentPage} variant="contained" color="primary"
+            <Pagination count={pageCount} page={isLive ? 0 : currentPage} variant="contained" color="primary"
                         boundaryCount={2} onChange={onChangePage} style={{margin: "10px"}}
                         showFirstButton showLastButton siblingCount={2}
             />
+            {canJumpToLive ?
+                <MythicChip label="Jump to live" onClick={onJumpToLive} tone="info" /> :
+                isLive && <MythicChip compact label="Live" tone="success" />
+            }
             <Typography style={{paddingLeft: "10px"}}>Total Responses: {totalCount}</Typography>
         </div>
     )
