@@ -32,6 +32,7 @@
     "@xyflow/react": "^12.6.0",
     "ace-builds": "^1.40.1",
     "anser": "^2.3.2",
+    "asciinema-player": "3.17.0",
     "dayjs": "^1.11.13",
     "elkjs": "^0.10.0",
     "graphql": "^16.10.0",

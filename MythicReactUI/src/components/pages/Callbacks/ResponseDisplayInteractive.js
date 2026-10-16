@@ -1,7 +1,7 @@
 import React from 'react';
 import {createTaskingMutation} from './CallbackMutations';
 import {snackActions} from "../../utilities/Snackbar";
-import { gql, useLazyQuery, useMutation, useSubscription } from '@apollo/client';
+import { gql, useLazyQuery, useMutation, useReactiveVar, useSubscription } from '@apollo/client';
 import {b64DecodeUnicode} from "./ResponseDisplay";
 import {SearchBar} from './ResponseDisplay';
 import Pagination from '@mui/material/Pagination';
@@ -16,6 +16,14 @@ import WrapTextIcon from '@mui/icons-material/WrapText';
 import {useTheme} from '@mui/material/styles';
 import HeightIcon from '@mui/icons-material/Height';
 import {MythicChip} from "../../MythicComponents/MythicChip";
+import {MythicDialog} from "../../MythicComponents/MythicDialogBase";
+import {MythicDraggableDialogTitle} from "../../MythicComponents/MythicDraggableDialogTitle";
+import {MythicDialogButton, MythicDialogFooter} from "../../MythicComponents/MythicDialogLayout";
+import DialogContent from '@mui/material/DialogContent';
+import {handleAuthLink} from "../../utilities/FileDownloadWithAuth";
+import {mythicFetch} from "../../utilities/MythicConnection";
+import {toLocalTime} from "../../utilities/Time";
+import {meState} from "../../../cache";
 
 const subResponsesQuery = gql`
 subscription subResponsesQuery($task_id: Int!, $cursor_id: Int!) {
@@ -24,6 +32,20 @@ subscription subResponsesQuery($task_id: Int!, $cursor_id: Int!) {
     response: response_text
     timestamp
     is_error
+  }
+}`;
+const subScreenRecordingsQuery = gql`
+subscription subInteractiveScreenRecordings($task_id: Int!) {
+  interactive_screen_session(where: {task_id: {_eq: $task_id}}, order_by: {id: asc}) {
+    id
+    start_response_id
+    end_response_id
+    start_time
+    end_time
+    collapsed
+    filemeta {
+      agent_file_id
+    }
   }
 }`;
 const getInteractiveResponsesPageQuery = gql`
@@ -64,6 +86,30 @@ const getInteractiveResponseWhereClause = (taskID, search) => {
         return {task_id: {_eq: taskID}};
     }
     return {task_id: {_eq: taskID}, response_escape: {_ilike: "%" + search + "%"}};
+}
+// eslint-disable-next-line no-control-regex
+const SCREEN_EXIT_REGEX = /\x1b\[\?(?:1049|1047|47)l|\x1bc/;
+// what a killed full-screen app leaves behind: alternate screen, mouse tracking, bracketed paste and hidden cursor
+const SCREEN_FORCED_EXIT = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h";
+const formatInteractiveScreenDuration = (startTime, endTime) => {
+    const seconds = Math.max(0, Math.round((new Date(endTime) - new Date(startTime)) / 1000));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds % 3600 / 60);
+    return `${hours > 0 ? `${hours}h` : ""}${hours > 0 || minutes > 0 ? `${minutes}m` : ""}${seconds % 60}s`;
+}
+// leave the alternate screen after a full-screen app that was killed before it could
+// collapsed recordings had their full-screen output removed from the responses, so there's nothing to leave
+export const addInteractiveScreenForcedExits = (entries, recordings) => {
+    const endResponseIDs = new Set(recordings.filter((recording) => recording.end_response_id && !recording.collapsed).map((recording) => recording.end_response_id));
+    if(endResponseIDs.size === 0){
+        return entries;
+    }
+    return entries.flatMap((entry) => {
+        if(entry.response === undefined || !endResponseIDs.has(entry.id) || SCREEN_EXIT_REGEX.test(entry.response)){
+            return [entry];
+        }
+        return [entry, {id: `screen-exit-${entry.id}`, timestamp: entry.timestamp, is_error: false, response: SCREEN_FORCED_EXIT}];
+    });
 }
 const decodeInteractiveResponse = (response) => {
     return {...response, response: b64DecodeUnicode(response.response)}
@@ -206,6 +252,7 @@ const InteractiveTerminalDisplay = ({
     onTerminalKeyEvent,
     onTerminalResize,
     onScreenModeChange,
+    startsInAlternateScreen,
 }) => {
     const terminalScrollContainerRef = React.useRef(null);
     const terminalElementRef = React.useRef(null);
@@ -430,8 +477,14 @@ const InteractiveTerminalDisplay = ({
         // only replay on input mode change to clear local echo, otherwise a full-screen app is wiped
         const inputModeNeedsReset = previousReplayState.inputMode !== inputMode && localEchoVisibleRef.current;
         const appendFromIndex = getInteractiveTerminalAppendIndex(previousReplayState.signatures, nextSignatures);
+        // the output starts part way through a full-screen app, so replay it on the alternate screen,
+        // unless that app is running live and the terminal is already there
+        const alternateScreenNeedsReplay = startsInAlternateScreen &&
+            !previousReplayState.startsInAlternateScreen &&
+            terminal.buffer.active.type === "normal";
         const canAppend = !hasPendingLineInput &&
             !inputModeNeedsReset &&
+            !alternateScreenNeedsReplay &&
             previousReplayState.settingsKey === settingsKey &&
             appendFromIndex >= 0;
         const previousViewportY = terminal.buffer.active.viewportY;
@@ -439,7 +492,7 @@ const InteractiveTerminalDisplay = ({
         if(!canAppend){
             terminal.reset();
         }
-        const terminalOutput = formatInteractiveTerminalEntries({
+        const terminalOutput = (!canAppend && startsInAlternateScreen ? "\x1b[?1049h" : "") + formatInteractiveTerminalEntries({
             entries: entriesToWrite,
             useASNIColor,
             showTaskStatus,
@@ -447,6 +500,7 @@ const InteractiveTerminalDisplay = ({
         replayStateRef.current = {
             settingsKey,
             inputMode,
+            startsInAlternateScreen,
             signatures: nextSignatures,
         };
         const afterWrite = () => {
@@ -474,7 +528,7 @@ const InteractiveTerminalDisplay = ({
         } else {
             afterWrite();
         }
-    }, [data, inputMode, scheduleFitTerminal, showTaskStatus, terminalReady, useASNIColor, wrapText]);
+    }, [data, inputMode, scheduleFitTerminal, showTaskStatus, startsInAlternateScreen, terminalReady, useASNIColor, wrapText]);
     return (
         <div className={`mythic-interactive-terminal-shell flex-fill relative${canSendInput ? " mythic-interactive-terminal-shell-input" : ""} min-h-0 overflow-hidden w-full`}>
             <div
@@ -636,9 +690,25 @@ export const ResponseDisplayInteractive = (props) =>{
             selectAllWarningShown.current = true;
         }
     }, []);
+    const {data: screenRecordingsData} = useSubscription(subScreenRecordingsQuery, {
+        variables: {task_id: props.task.id},
+    });
+    const screenRecordings = React.useMemo( () => {
+        return screenRecordingsData?.interactive_screen_session || [];
+    }, [screenRecordingsData]);
+    const [playingRecordingFileID, setPlayingRecordingFileID] = React.useState(null);
+    const collapsedRecordingIDsRef = React.useRef(null);
     const visibleOutput = React.useMemo( () => {
-        return sortInteractiveEntries(rawResponses);
-    }, [rawResponses]);
+        return addInteractiveScreenForcedExits(sortInteractiveEntries(rawResponses), screenRecordings);
+    }, [rawResponses, screenRecordings]);
+    const startsInAlternateScreen = React.useMemo( () => {
+        const firstResponse = rawResponses.find((entry) => entry.response !== undefined);
+        if(search !== "" || firstResponse === undefined){
+            return false;
+        }
+        return screenRecordings.some((recording) => !recording.collapsed && recording.start_response_id < firstResponse.id &&
+            (!recording.end_response_id || recording.end_response_id >= firstResponse.id));
+    }, [rawResponses, screenRecordings, search]);
     React.useEffect( () => {
         rawResponsesRef.current = rawResponses;
     }, [rawResponses]);
@@ -781,6 +851,7 @@ export const ResponseDisplayInteractive = (props) =>{
         selectAllWarningShown.current = false;
         setFollowLive(true);
         setStreamCursorID(null);
+        collapsedRecordingIDsRef.current = null;
     }, [props.task.id, setTrackedTotalCount]);
     React.useEffect( () => {
         selectAllWarningShown.current = false;
@@ -868,6 +939,29 @@ export const ResponseDisplayInteractive = (props) =>{
             setBackdropOpen(false);
         }
     }, [backdropOpen, fetchResponsePage, props.selectAllOutput, search, setTrackedTotalCount, warnSelectAllCapped]);
+    React.useEffect( () => {
+        if(screenRecordingsData === undefined){
+            return;
+        }
+        const collapsedIDs = screenRecordings.filter((recording) => recording.collapsed).map((recording) => recording.id);
+        const previousCollapsedIDs = collapsedRecordingIDsRef.current;
+        collapsedRecordingIDsRef.current = new Set(collapsedIDs);
+        if(previousCollapsedIDs === null || collapsedIDs.every((id) => previousCollapsedIDs.has(id))){
+            return;
+        }
+        // a finished full-screen app's output was moved into its recording, so reload what's shown
+        rawResponsesRef.current = [];
+        taskResponseCountRef.current = 0;
+        setTrackedTotalCount(0);
+        if(isLiveRef.current){
+            fetchLatestResponsesQuery({variables: {
+                task_id: props.task.id,
+                fetchLimit: liveWindowSizeRef.current,
+            }});
+        } else {
+            fetchResponsePage(currentPageRef.current, false);
+        }
+    }, [screenRecordings]); // eslint-disable-line react-hooks/exhaustive-deps
     useSubscription(subResponsesQuery, {
         variables: {task_id: props.task.id, cursor_id: streamCursorID || 0},
         skip: streamCursorID === null,
@@ -1157,6 +1251,13 @@ export const ResponseDisplayInteractive = (props) =>{
           backgroundColor: theme.outputBackgroundColor + (theme.palette.mode === 'dark' ? "B0" : "E0"),
           color: theme.outputTextColor,
       }}>
+          {playingRecordingFileID !== null &&
+              <MythicDialog fullWidth={true} maxWidth="lg" open={true}
+                            onClose={() => setPlayingRecordingFileID(null)}
+                            innerDialog={<InteractiveScreenRecordingDialog agentFileID={playingRecordingFileID}
+                                                                           onClose={() => setPlayingRecordingFileID(null)} />}
+              />
+          }
           <Backdrop open={backdropOpen} style={{zIndex: 2, position: "absolute",}} invisible={false}>
               <div style={{
                   borderRadius: "4px",
@@ -1190,6 +1291,8 @@ export const ResponseDisplayInteractive = (props) =>{
                       autoScroll={autoScroll}
                       toggleAutoScroll={toggleAutoScroll}
                       tuiActive={tuiActive}
+                      screenRecordings={screenRecordings}
+                      onPlayScreenRecording={setPlayingRecordingFileID}
                   />
               }
               <div style={{overflow: "hidden", width: "100%", marginBottom: "5px", height: props.expand ? "100%": undefined,
@@ -1206,7 +1309,8 @@ export const ResponseDisplayInteractive = (props) =>{
                                               onTerminalInput={handleTerminalData}
                                               onTerminalKeyEvent={handleTerminalKeyEvent}
                                               onTerminalResize={sendTerminalResize}
-                                              onScreenModeChange={setScreenAlternate}/>
+                                              onScreenModeChange={setScreenAlternate}
+                                              startsInAlternateScreen={startsInAlternateScreen}/>
               </div>
           </div>
 
@@ -1233,6 +1337,8 @@ const InteractiveTerminalToolbar = ({
     autoScroll,
     toggleAutoScroll,
     tuiActive,
+    screenRecordings,
+    onPlayScreenRecording,
 }) => {
     const [enterAnchorEl, setEnterAnchorEl] = React.useState(null);
     const selectedEnter = EnterOptions[selectedEnterOption] || EnterOptions[0];
@@ -1289,6 +1395,7 @@ const InteractiveTerminalToolbar = ({
                     </div>
                 }
                 <div className="mythic-interactive-terminal-toolbar-spacer flex-fill min-w-0" />
+                <InteractiveScreenRecordingsMenu recordings={screenRecordings} onPlay={onPlayScreenRecording} />
                 <div className="mythic-interactive-terminal-toggle-group bg-output-control border-output items-center inline-flex flex-none overflow-hidden rounded" role="group" aria-label="Terminal display options">
                     <MythicStyledTooltip title={tuiActive ? "Unavailable while a full-screen app is running" : useASNIColor ?  "Disable ANSI Color" : "Enable ANSI Color"} >
                         <button
@@ -1328,6 +1435,82 @@ const InteractiveTerminalToolbar = ({
             }
         </div>
     )
+}
+const InteractiveScreenRecordingsMenu = ({recordings, onPlay}) => {
+    const me = useReactiveVar(meState);
+    const [anchorEl, setAnchorEl] = React.useState(null);
+    if(recordings.length === 0){
+        return null;
+    }
+    const playRecording = (fileID) => {
+        setAnchorEl(null);
+        onPlay(fileID);
+    };
+    return (
+        <>
+            <MythicStyledTooltip title="Full-screen apps recorded in this session">
+                <MythicChip compact label={`${recordings.length} recording${recordings.length === 1 ? "" : "s"}`}
+                            onClick={(event) => setAnchorEl(event.currentTarget)} />
+            </MythicStyledTooltip>
+            <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={() => setAnchorEl(null)}>
+                {[...recordings].reverse().map((recording) => {
+                    const fileID = recording.filemeta?.agent_file_id;
+                    return (
+                        <MenuItem key={recording.id} disableRipple className="items-center flex gap-4">
+                            <span className="flex-fill">
+                                {toLocalTime(recording.start_time, me?.user?.view_utc_time)}
+                                {" · "}
+                                {recording.end_time ? formatInteractiveScreenDuration(recording.start_time, recording.end_time) : "recording…"}
+                            </span>
+                            <MythicChip compact label="▶ Play" disabled={!fileID} onClick={() => playRecording(fileID)} />
+                            <MythicChip compact label="Download" disabled={!fileID}
+                                        onClick={(event) => handleAuthLink(event, "/direct/download/" + fileID)} />
+                        </MenuItem>
+                    );
+                })}
+            </Menu>
+        </>
+    );
+}
+const InteractiveScreenRecordingDialog = ({agentFileID, onClose}) => {
+    const playerElementRef = React.useRef(null);
+    React.useEffect( () => {
+        let player = null;
+        let cancelled = false;
+        Promise.all([
+            import('asciinema-player'),
+            import('asciinema-player/dist/bundle/asciinema-player.css'),
+            mythicFetch("/direct/download/" + agentFileID, {
+                headers: {'Authorization': `Bearer ${localStorage.getItem('access_token')}`},
+            }).then((response) => {
+                if(!response.ok){
+                    throw new Error(`status ${response.status}`);
+                }
+                return response.text();
+            }),
+        ]).then(([AsciinemaPlayer, , recording]) => {
+            if(!cancelled && playerElementRef.current){
+                player = AsciinemaPlayer.create({data: recording}, playerElementRef.current, {autoPlay: true, fit: "width"});
+            }
+        }).catch((error) => {
+            snackActions.error("Failed to load recording: " + error.message);
+        });
+        return () => {
+            cancelled = true;
+            player?.dispose();
+        };
+    }, [agentFileID]);
+    return (
+        <React.Fragment>
+            <MythicDraggableDialogTitle>Full-screen app recording</MythicDraggableDialogTitle>
+            <DialogContent dividers={true}>
+                <div ref={playerElementRef} />
+            </DialogContent>
+            <MythicDialogFooter>
+                <MythicDialogButton onClick={onClose}>Close</MythicDialogButton>
+            </MythicDialogFooter>
+        </React.Fragment>
+    );
 }
 const InteractivePaginationBar = ({totalCount, currentPage, onSubmitPageChange, pageSize, selectAllOutput,
                                       isLive, canJumpToLive, onJumpToLive, tuiActive}) => {
