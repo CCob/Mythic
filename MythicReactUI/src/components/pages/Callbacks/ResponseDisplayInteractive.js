@@ -146,7 +146,8 @@ export const decodeInteractiveResponse = (response) => {
         utf8Tail: bytes.slice(end),
     };
 }
-// rebuild a character split across two responses at the start of the later one, so written entries never change
+// rebuild a character split across two responses at the start of the later one, kept apart from its text so
+// the entry still matches what was written once the earlier response leaves the live window
 export const joinInteractiveSplitCharacters = (entries) => {
     let previousTail = new Uint8Array(0);
     return entries.map((entry) => {
@@ -161,7 +162,7 @@ export const joinInteractiveSplitCharacters = (entries) => {
         const character = new Uint8Array(tail.length + entry.utf8Head.length);
         character.set(tail);
         character.set(entry.utf8Head, tail.length);
-        return {...entry, response: new TextDecoder().decode(character) + entry.response};
+        return {...entry, characterPrefix: new TextDecoder().decode(character)};
     });
 }
 const getInteractiveAggregateCount = (data) => {
@@ -270,7 +271,7 @@ const getInteractiveTerminalTaskStatus = ({task, useASNIColor}) => {
 }
 export const formatInteractiveTerminalEntry = ({entry, useASNIColor, showTaskStatus}) => {
     if(entry.response !== undefined){
-        const terminalResponse = sanitizeTerminalOutput(entry.response);
+        const terminalResponse = sanitizeTerminalOutput((entry.characterPrefix || "") + entry.response);
         const response = useASNIColor ? terminalResponse : stripAnsiStyleCodes(terminalResponse);
         if(entry.is_error && useASNIColor){
             return `\x1b[37;41m${response}\x1b[0m`;

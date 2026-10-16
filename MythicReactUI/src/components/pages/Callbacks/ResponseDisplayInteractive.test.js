@@ -3,6 +3,7 @@ import {createRoot} from 'react-dom/client';
 import {
     addInteractiveScreenForcedExits,
     decodeInteractiveResponse,
+    formatInteractiveTerminalEntry,
     getInteractiveTerminalAppendIndex,
     joinInteractiveSplitCharacters,
     ResponseDisplayInteractive,
@@ -152,10 +153,15 @@ describe("joinInteractiveSplitCharacters", () => {
 
     test("rebuilds a character split across responses at the start of the response that completes it", () => {
         const entries = joinInteractiveSplitCharacters(chunks.map(decode));
-        expect(entries.map((entry) => entry.response)).toEqual(["a", "╱b"]);
+        expect(entries.map((entry) => formatInteractiveTerminalEntry({entry}))).toEqual(["a", "╱b"]);
     });
     test("keeps the text of earlier responses unchanged as later ones arrive", () => {
         expect(joinInteractiveSplitCharacters(chunks.slice(0, 1).map(decode))[0].response).toBe("a");
+    });
+    test("keeps a response's text unchanged once the response before it leaves the live window", () => {
+        const [, joined] = joinInteractiveSplitCharacters(chunks.map(decode));
+        const [alone] = joinInteractiveSplitCharacters(chunks.slice(1).map(decode));
+        expect(alone.response).toBe(joined.response);
     });
     test("leaves whole characters and entries without bytes unchanged", () => {
         const task = {id: 5, original_params: "ls"};
