@@ -1113,6 +1113,9 @@ func handleAgentMessagePostResponseInteractiveOutput(agentResponses *[]agentMess
 			logging.LogError(err, "Failed to insert new interactive task output", "task_id", responseOutput.TaskID)
 		} else {
 			go emitResponseLog(responseOutput.ID)
+			if agentResponse.MessageType == InteractiveTask.Output || agentResponse.MessageType == InteractiveTask.Error {
+				trackInteractiveScreen(task, responseOutput.ID, base64Decoded)
+			}
 		}
 	}
 }
