@@ -2,7 +2,9 @@ import React, {act} from 'react';
 import {createRoot} from 'react-dom/client';
 import {
     addInteractiveScreenForcedExits,
+    decodeInteractiveResponse,
     getInteractiveTerminalAppendIndex,
+    joinInteractiveSplitCharacters,
     ResponseDisplayInteractive,
 } from './ResponseDisplayInteractive';
 
@@ -76,6 +78,22 @@ jest.mock('@xterm/addon-fit', () => ({
         proposeDimensions(){ return {cols: 100, rows: 30}; }
     },
 }));
+jest.mock('@xterm/addon-webgl', () => ({
+    WebglAddon: class {
+        activate(){}
+        dispose(){}
+        onContextLoss(){}
+    },
+}), {virtual: true});
+jest.mock('@xterm/addon-unicode11', () => ({
+    Unicode11Addon: class {
+        activate(terminal){
+            const wcwidth = (codepoint) => codepoint < 32 ? 0 : 1;
+            terminal.unicode.register({version: "11", wcwidth, charProperties: (codepoint) => wcwidth(codepoint) << 1});
+        }
+        dispose(){}
+    },
+}), {virtual: true});
 jest.mock('@xterm/xterm', () => {
     const actual = jest.requireActual('@xterm/xterm');
     // jsdom has no canvas, so skip rendering but keep the real parser and buffers
@@ -121,6 +139,29 @@ describe("getInteractiveTerminalAppendIndex", () => {
 
     test("requires a replay when next is empty", () => {
         expect(getInteractiveTerminalAppendIndex(["a"], [])).toBe(-1);
+    });
+});
+
+// jsdom has no TextDecoder
+global.TextDecoder = global.TextDecoder || require("util").TextDecoder;
+
+describe("joinInteractiveSplitCharacters", () => {
+    // "a╱b" is 61 E2 95 B1 62, so these chunks cut the ╱ after its second byte
+    const chunks = [[0x61, 0xE2, 0x95], [0xB1, 0x62]];
+    const decode = (bytes, id) => decodeInteractiveResponse({id, response: Buffer.from(bytes).toString("base64")});
+
+    test("rebuilds a character split across responses at the start of the response that completes it", () => {
+        const entries = joinInteractiveSplitCharacters(chunks.map(decode));
+        expect(entries.map((entry) => entry.response)).toEqual(["a", "╱b"]);
+    });
+    test("keeps the text of earlier responses unchanged as later ones arrive", () => {
+        expect(joinInteractiveSplitCharacters(chunks.slice(0, 1).map(decode))[0].response).toBe("a");
+    });
+    test("leaves whole characters and entries without bytes unchanged", () => {
+        const task = {id: 5, original_params: "ls"};
+        const entries = joinInteractiveSplitCharacters([decode([0xE2, 0x95, 0xB1], 1), task]);
+        expect(entries[0].response).toBe("╱");
+        expect(entries[1]).toBe(task);
     });
 });
 
@@ -238,13 +279,17 @@ describe("ResponseDisplayInteractive", () => {
         expect(global.mockApollo.subscriptions.subResponsesQuery.skip).toBe(false);
         expect(global.mockApollo.subscriptions.subResponsesQuery.variables.cursor_id).toBe(10);
 
-        await streamResponse({id: 11, response: encode("\x1b[?1049h\x1b[2J\x1b[1;1Htop"), timestamp: "2026-10-15T09:00:01", is_error: false});
+        await streamResponse({id: 11, response: encode("\x1b[?1049h\x1b[2J\x1b[1;1Htop\x1b[1;5H\nx"), timestamp: "2026-10-15T09:00:01", is_error: false});
         expect(global.mockTerminal.buffer.active.type).toBe("alternate");
+        // a bare LF moves down a row in the same column while the app is full-screen
+        expect(global.mockTerminal.buffer.active.getLine(1).translateToString(true)).toBe("    x");
         expect(container.textContent).toContain("Full-screen app");
         expect(container.textContent).toContain("Raw key mode");
 
-        await streamResponse({id: 12, response: encode("\x1b[?1049l$ "), timestamp: "2026-10-15T09:00:02", is_error: false});
+        await streamResponse({id: 12, response: encode("\x1b[?1049l$ \nok"), timestamp: "2026-10-15T09:00:02", is_error: false});
         expect(global.mockTerminal.buffer.active.type).toBe("normal");
+        const normalBuffer = global.mockTerminal.buffer.active;
+        expect(normalBuffer.getLine(normalBuffer.baseY + normalBuffer.cursorY).translateToString(true)).toBe("ok");
         expect(container.textContent).not.toContain("Full-screen app");
         expect(container.textContent).toContain("Line mode");
     });

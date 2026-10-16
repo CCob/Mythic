@@ -11,6 +11,8 @@ import PaletteIcon from '@mui/icons-material/Palette';
 import {MythicStyledTooltip} from "../../MythicComponents/MythicStyledTooltip";
 import {Terminal} from '@xterm/xterm';
 import {FitAddon} from '@xterm/addon-fit';
+import {WebglAddon} from '@xterm/addon-webgl';
+import {Unicode11Addon} from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import WrapTextIcon from '@mui/icons-material/WrapText';
 import {useTheme} from '@mui/material/styles';
@@ -111,8 +113,56 @@ export const addInteractiveScreenForcedExits = (entries, recordings) => {
         return [entry, {id: `screen-exit-${entry.id}`, timestamp: entry.timestamp, is_error: false, response: SCREEN_FORCED_EXIT}];
     });
 }
-const decodeInteractiveResponse = (response) => {
-    return {...response, response: b64DecodeUnicode(response.response)}
+// the bytes of a character cut off by the start or end of an agent's output chunk
+const getInteractiveSplitCharacterBounds = (bytes) => {
+    let start = 0;
+    while(start < bytes.length && start < 3 && (bytes[start] & 0xC0) === 0x80){
+        start++;
+    }
+    let end = bytes.length;
+    for(let i = bytes.length - 1; i >= start && i >= bytes.length - 3; i--){
+        if((bytes[i] & 0xC0) !== 0x80){
+            const length = bytes[i] >= 0xF0 ? 4 : bytes[i] >= 0xE0 ? 3 : bytes[i] >= 0xC0 ? 2 : 1;
+            if(bytes.length - i < length){
+                end = i;
+            }
+            break;
+        }
+    }
+    return {start, end};
+}
+export const decodeInteractiveResponse = (response) => {
+    let bytes;
+    try{
+        bytes = Uint8Array.from(window.atob(response.response), (character) => character.charCodeAt(0));
+    }catch(error){
+        return {...response, response: b64DecodeUnicode(response.response)};
+    }
+    const {start, end} = getInteractiveSplitCharacterBounds(bytes);
+    return {
+        ...response,
+        response: new TextDecoder().decode(bytes.subarray(start, end)),
+        utf8Head: bytes.slice(0, start),
+        utf8Tail: bytes.slice(end),
+    };
+}
+// rebuild a character split across two responses at the start of the later one, so written entries never change
+export const joinInteractiveSplitCharacters = (entries) => {
+    let previousTail = new Uint8Array(0);
+    return entries.map((entry) => {
+        if(entry.utf8Head === undefined){
+            return entry;
+        }
+        const tail = previousTail;
+        previousTail = entry.utf8Tail;
+        if(tail.length === 0 && entry.utf8Head.length === 0){
+            return entry;
+        }
+        const character = new Uint8Array(tail.length + entry.utf8Head.length);
+        character.set(tail);
+        character.set(entry.utf8Head, tail.length);
+        return {...entry, response: new TextDecoder().decode(character) + entry.response};
+    });
 }
 const getInteractiveAggregateCount = (data) => {
     return data?.response_aggregate?.aggregate?.count || 0;
@@ -385,6 +435,7 @@ const InteractiveTerminalDisplay = ({
             return;
         }
         const terminal = new Terminal({
+            allowProposedApi: true,
             allowTransparency: true,
             convertEol: true,
             cursorBlink: true,
@@ -399,6 +450,8 @@ const InteractiveTerminalDisplay = ({
         });
         // alternate screen buffer (ESC[?1049h etc) means a full-screen app is running
         const bufferChangeDisposable = terminal.buffer.onBufferChange((buffer) => {
+            // full-screen apps use a bare LF to move down a row in the same column, so only convert it for line output
+            terminal.options.convertEol = buffer.type !== "alternate";
             onScreenModeChangeRef.current?.(buffer.type === "alternate");
             scheduleFitTerminal();
         });
@@ -426,7 +479,18 @@ const InteractiveTerminalDisplay = ({
         });
         const fitAddon = new FitAddon();
         terminal.loadAddon(fitAddon);
+        // apps lay out emoji such as U+2615 as two cells, xterm.js defaults to Unicode 6 widths
+        terminal.loadAddon(new Unicode11Addon());
+        terminal.unicode.activeVersion = "11";
         terminal.open(terminalElement);
+        // the DOM renderer lets fallback-font glyphs (braille, blocks) shift the rest of a row out of line
+        try{
+            const webglAddon = new WebglAddon();
+            webglAddon.onContextLoss(() => webglAddon.dispose());
+            terminal.loadAddon(webglAddon);
+        }catch(error){
+            console.warn("WebGL unavailable, using the DOM renderer", error);
+        }
         terminalRef.current = terminal;
         fitAddonRef.current = fitAddon;
         resizeObserverRef.current = new ResizeObserver(() => scheduleFitTerminal());
@@ -699,7 +763,7 @@ export const ResponseDisplayInteractive = (props) =>{
     const [playingRecordingFileID, setPlayingRecordingFileID] = React.useState(null);
     const collapsedRecordingIDsRef = React.useRef(null);
     const visibleOutput = React.useMemo( () => {
-        return addInteractiveScreenForcedExits(sortInteractiveEntries(rawResponses), screenRecordings);
+        return addInteractiveScreenForcedExits(joinInteractiveSplitCharacters(sortInteractiveEntries(rawResponses)), screenRecordings);
     }, [rawResponses, screenRecordings]);
     const startsInAlternateScreen = React.useMemo( () => {
         const firstResponse = rawResponses.find((entry) => entry.response !== undefined);
