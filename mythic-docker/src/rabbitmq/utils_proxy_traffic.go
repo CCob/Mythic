@@ -1119,6 +1119,7 @@ func (c *callbackPortsInUse) Remove(callbackId int, portType CallbackPortType, l
 	c.removePortLocked(port)
 	c.Unlock()
 	if portType == CALLBACK_PORT_TYPE_INTERACTIVE {
+		saveInteractiveLiveTask(port.TaskID)
 		endInteractiveScreenTask(port.TaskID)
 	}
 	return nil

@@ -212,6 +212,8 @@ type interactiveScreenTask struct {
 	parser    interactiveScreenParser
 	session   interactiveScreenSession
 	utf8Carry []byte
+	// output reaches the recording when it's saved, after resizes that arrived later, so times only move forward
+	lastEventTime time.Time
 }
 
 var interactiveScreenTasks = struct {
@@ -243,52 +245,56 @@ func getInteractiveScreenTask(taskID int) *interactiveScreenTask {
 	return screenTask
 }
 
-func trackInteractiveScreen(task databaseStructs.Task, responseID int, output []byte) {
+func trackInteractiveScreen(task databaseStructs.Task, responseID int, output []byte, at time.Time) {
 	screenTask := getInteractiveScreenTask(task.ID)
 	screenTask.Lock()
 	defer screenTask.Unlock()
 	recorded := false
 	for _, change := range screenTask.parser.feed(output) {
 		if change.Alternate {
-			screenTask.session = startInteractiveScreenSession(task, responseID)
+			screenTask.session = startInteractiveScreenSession(task, responseID, at)
 			recorded = false
 			continue
 		}
 		if !recorded {
-			screenTask.recordOutput(output)
+			screenTask.recordOutput(output, at)
 			recorded = true
 		}
 		screenTask.endSession(sql.NullInt64{Int64: int64(responseID), Valid: true})
 	}
 	if screenTask.session.ID > 0 && !recorded {
-		screenTask.recordOutput(output)
+		screenTask.recordOutput(output, at)
 	}
 }
 
-func (screenTask *interactiveScreenTask) recordOutput(output []byte) {
+func (screenTask *interactiveScreenTask) recordOutput(output []byte, at time.Time) {
 	var data []byte
 	data, screenTask.utf8Carry = splitIncompleteUTF8(append(screenTask.utf8Carry, output...))
-	screenTask.recordEvent("o", string(data))
+	screenTask.recordEvent("o", string(data), at)
 }
 
-func (screenTask *interactiveScreenTask) recordEvent(code string, data string) {
+func (screenTask *interactiveScreenTask) recordEvent(code string, data string, at time.Time) {
 	if screenTask.session.Path == "" || len(data) == 0 {
 		return
 	}
+	if at.Before(screenTask.lastEventTime) {
+		at = screenTask.lastEventTime
+	}
+	screenTask.lastEventTime = at
 	file, err := os.OpenFile(screenTask.session.Path, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		logging.LogError(err, "Failed to open interactive screen recording", "path", screenTask.session.Path)
 		return
 	}
 	defer file.Close()
-	if _, err = file.Write(interactiveScreenCastEvent(time.Since(screenTask.session.StartTime), code, data)); err != nil {
+	if _, err = file.Write(interactiveScreenCastEvent(at.Sub(screenTask.session.StartTime), code, data)); err != nil {
 		logging.LogError(err, "Failed to write interactive screen recording", "path", screenTask.session.Path)
 	}
 }
 
 func (screenTask *interactiveScreenTask) endSession(responseID sql.NullInt64) {
 	if screenTask.session.ID > 0 {
-		screenTask.recordEvent("o", string(screenTask.utf8Carry))
+		screenTask.recordEvent("o", string(screenTask.utf8Carry), time.Now().UTC())
 		// without an exit sequence the session ends at the task's latest output
 		if _, err := database.DB.Exec(`UPDATE interactive_screen_session
 			SET end_time=$1, end_response_id=COALESCE($2, (SELECT max(id) FROM response WHERE task_id=interactive_screen_session.task_id))
@@ -303,8 +309,8 @@ func (screenTask *interactiveScreenTask) endSession(responseID sql.NullInt64) {
 	screenTask.utf8Carry = nil
 }
 
-func startInteractiveScreenSession(task databaseStructs.Task, responseID int) interactiveScreenSession {
-	session := interactiveScreenSession{StartTime: time.Now().UTC()}
+func startInteractiveScreenSession(task databaseStructs.Task, responseID int, start time.Time) interactiveScreenSession {
+	session := interactiveScreenSession{StartTime: start}
 	cols, rows := 0, 0
 	params := ""
 	if err := database.DB.Get(&params, `SELECT params FROM task
@@ -483,6 +489,7 @@ func startInteractiveScreenRecordingCleanup() {
 	defer ticker.Stop()
 	for range ticker.C {
 		finalizeClosedInteractiveScreenRecordings()
+		forgetIdleInteractiveLiveTasks()
 	}
 }
 
@@ -500,7 +507,7 @@ func recordInteractiveScreenResize(taskID int, params string) {
 	screenTask.Lock()
 	defer screenTask.Unlock()
 	if screenTask.session.ID > 0 {
-		screenTask.recordEvent("r", fmt.Sprintf("%dx%d", cols, rows))
+		screenTask.recordEvent("r", fmt.Sprintf("%dx%d", cols, rows), time.Now().UTC())
 	}
 }
 

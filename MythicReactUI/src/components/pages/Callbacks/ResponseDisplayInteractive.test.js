@@ -1,7 +1,9 @@
 import React, {act} from 'react';
 import {createRoot} from 'react-dom/client';
 import {
+    addInteractiveLiveOutput,
     addInteractiveScreenForcedExits,
+    decodeInteractiveLiveOutput,
     decodeInteractiveResponse,
     formatInteractiveTerminalEntry,
     getInteractiveTerminalAppendIndex,
@@ -39,6 +41,30 @@ jest.mock('./ResponseDisplay', () => ({
     SearchBar: () => null,
 }));
 jest.mock('@xterm/xterm/css/xterm.css', () => ({}));
+jest.mock('./InteractiveLiveSocket', () => {
+    global.mockLiveStreams = [];
+    return {
+        openInteractiveLiveStream: (taskID, handlers) => {
+            const stream = {taskID, handlers, inputs: [], credits: 0, closed: false, canWrite: false};
+            global.mockLiveStreams.push(stream);
+            return {
+                sendInput: (input) => {
+                    if(!stream.canWrite || stream.closed){
+                        return false;
+                    }
+                    stream.inputs.push(input);
+                    return true;
+                },
+                credit: (bytes) => {
+                    stream.credits += bytes;
+                },
+                close: () => {
+                    stream.closed = true;
+                },
+            };
+        },
+    };
+});
 jest.mock('../../utilities/Time', () => ({
     toLocalTime: (value) => `local:${value}`,
 }));
@@ -202,6 +228,47 @@ describe("addInteractiveScreenForcedExits", () => {
     });
 });
 
+describe("addInteractiveLiveOutput", () => {
+    let sequence = 0;
+    const live = (text) => decodeInteractiveLiveOutput({messageType: 1, bytes: Buffer.from(text), liveSequence: sequence++, liveOffset: 0});
+    const row = (id, text, interactiveTaskType=1) => decodeInteractiveResponse({
+        id, response: Buffer.from(text).toString("base64"), timestamp: `t${id}`, interactive_task_type: interactiveTaskType,
+    });
+
+    test("leaves entries alone without a live stream", () => {
+        const entries = [row(1, "a")];
+        expect(addInteractiveLiveOutput(entries, null)).toBe(entries);
+    });
+    test("shows live output after the loaded responses until it's saved", () => {
+        const pending = [live("b"), live("c")];
+        expect(addInteractiveLiveOutput([row(1, "a")], {startResponseID: 1, saved: [], pending}).map((entry) => entry.response))
+            .toEqual(["a", "b", "c"]);
+    });
+    test("shows a saved response as the live output it was made from, whether or not it has loaded", () => {
+        const output = [live("b"), live("c")];
+        const saved = [{responseID: 2, output, byteLength: 2}];
+        const waiting = addInteractiveLiveOutput([row(1, "a")], {startResponseID: 1, saved, pending: []});
+        const loaded = addInteractiveLiveOutput([row(1, "a"), row(2, "bc")], {startResponseID: 1, saved, pending: []});
+        expect(loaded.map((entry) => entry.liveSequence)).toEqual(waiting.map((entry) => entry.liveSequence));
+        expect(loaded.map((entry) => entry.id)).toEqual([1, undefined, 2]);
+    });
+    test("hides responses saved from live output that hasn't been matched to them yet", () => {
+        const entries = [row(1, "a"), row(2, "b"), row(3, "note", null)];
+        expect(addInteractiveLiveOutput(entries, {startResponseID: 1, saved: [], pending: [live("b")]}).map((entry) => entry.response))
+            .toEqual(["a", "note", "b"]);
+    });
+    test("drops live output whose response was deleted", () => {
+        const saved = [{responseID: 2, output: [live("full-screen")], byteLength: 11}];
+        expect(addInteractiveLiveOutput([row(1, "a"), row(3, "b", null)], {startResponseID: 1, saved, pending: []}).map((entry) => entry.response))
+            .toEqual(["a", "b"]);
+    });
+    test("shows the response instead once it no longer matches its live output", () => {
+        const saved = [{responseID: 2, output: [live("full-screen")], byteLength: 11}];
+        expect(addInteractiveLiveOutput([row(2, "")], {startResponseID: 1, saved, pending: []}).map((entry) => entry.response))
+            .toEqual([""]);
+    });
+});
+
 describe("ResponseDisplayInteractive", () => {
     let container;
     let root;
@@ -238,6 +305,7 @@ describe("ResponseDisplayInteractive", () => {
         jest.useFakeTimers();
         global.mockApollo.mutations.length = 0;
         global.mockApollo.subscriptionData = {};
+        global.mockLiveStreams.length = 0;
         global.mockApollo.lazy.getInteractiveLatestResponses?.calls.splice(0);
         container = document.createElement("div");
         document.body.appendChild(container);
@@ -518,5 +586,55 @@ describe("ResponseDisplayInteractive", () => {
         const lines = Array.from({length: buffer.length}, (_, i) => buffer.getLine(i).translateToString(true)).filter((line) => line !== "");
         expect(lines).toEqual(["$ top", "$ "]);
         expect(container.textContent).not.toContain("Full-screen app");
+    });
+
+    test("sends input over the live stream, shows its output straight away, and doesn't replay when the response arrives", async () => {
+        const task = {
+            id: 1,
+            response_count: 0,
+            display_id: 1,
+            is_interactive_task: false,
+            callback: {display_id: 1},
+            command: {cmd: "pty"},
+        };
+        // eslint-disable-next-line testing-library/no-unnecessary-act
+        await act(async () => {
+            root.render(<ResponseDisplayInteractive task={task} selectAllOutput={false} />);
+        });
+        const stream = global.mockLiveStreams[global.mockLiveStreams.length - 1];
+        expect(stream.taskID).toBe(1);
+        stream.canWrite = true;
+        await act(async () => {
+            stream.handlers.onOpened({responseID: 10, canWrite: true});
+        });
+        await settle();
+        // the terminal's size goes over the live stream rather than through GraphQL
+        expect(stream.inputs).toEqual([{params: "100,30,0,0", originalParams: "resize 100x30", interactiveTaskType: 25}]);
+        expect(global.mockApollo.mutations).toEqual([]);
+        await act(async () => {
+            global.mockApollo.lazy.getInteractiveLatestResponses.options.onCompleted({
+                response: [{id: 10, response: encode("$ "), timestamp: "2026-10-15T09:00:00", is_error: false}],
+                response_aggregate: {aggregate: {count: 1}},
+            });
+        });
+        await settle();
+
+        const reset = jest.spyOn(global.mockTerminal, "reset");
+        await act(async () => {
+            stream.handlers.onOutput(1, new Uint8Array(Buffer.from("ls\r\nfile\r\n")));
+        });
+        await settle();
+        const buffer = global.mockTerminal.buffer.active;
+        const lines = () => Array.from({length: buffer.length}, (_, i) => buffer.getLine(i).translateToString(true)).filter((line) => line !== "");
+        expect(lines()).toEqual(["$ ls", "file"]);
+        // written output hands its window back to the server
+        expect(stream.credits).toBe(10);
+
+        await act(async () => {
+            stream.handlers.onSaved(11);
+        });
+        await streamResponse({id: 11, response: encode("ls\r\nfile\r\n"), timestamp: "2026-10-15T09:00:01", is_error: false, interactive_task_type: 1});
+        expect(lines()).toEqual(["$ ls", "file"]);
+        expect(reset).not.toHaveBeenCalled();
     });
 });

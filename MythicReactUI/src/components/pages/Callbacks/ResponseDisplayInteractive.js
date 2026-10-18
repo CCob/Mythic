@@ -26,6 +26,7 @@ import {handleAuthLink} from "../../utilities/FileDownloadWithAuth";
 import {mythicFetch} from "../../utilities/MythicConnection";
 import {toLocalTime} from "../../utilities/Time";
 import {meState} from "../../../cache";
+import {openInteractiveLiveStream} from "./InteractiveLiveSocket";
 
 const subResponsesQuery = gql`
 subscription subResponsesQuery($task_id: Int!, $cursor_id: Int!) {
@@ -34,6 +35,7 @@ subscription subResponsesQuery($task_id: Int!, $cursor_id: Int!) {
     response: response_text
     timestamp
     is_error
+    interactive_task_type
   }
 }`;
 const subScreenRecordingsQuery = gql`
@@ -74,6 +76,7 @@ query getInteractiveLatestResponses($task_id: Int!, $fetchLimit: Int!) {
     response: response_text
     timestamp
     is_error
+    interactive_task_type
   }
   response_aggregate(where: {task_id: {_eq: $task_id}}) {
     aggregate {
@@ -131,6 +134,15 @@ const getInteractiveSplitCharacterBounds = (bytes) => {
     }
     return {start, end};
 }
+const decodeInteractiveBytes = (bytes) => {
+    const {start, end} = getInteractiveSplitCharacterBounds(bytes);
+    return {
+        response: new TextDecoder().decode(bytes.subarray(start, end)),
+        utf8Head: bytes.slice(0, start),
+        utf8Tail: bytes.slice(end),
+        byteLength: bytes.length,
+    };
+}
 export const decodeInteractiveResponse = (response) => {
     let bytes;
     try{
@@ -138,13 +150,42 @@ export const decodeInteractiveResponse = (response) => {
     }catch(error){
         return {...response, response: b64DecodeUnicode(response.response)};
     }
-    const {start, end} = getInteractiveSplitCharacterBounds(bytes);
-    return {
-        ...response,
-        response: new TextDecoder().decode(bytes.subarray(start, end)),
-        utf8Head: bytes.slice(0, start),
-        utf8Tail: bytes.slice(end),
-    };
+    return {...response, ...decodeInteractiveBytes(bytes)};
+}
+// InteractiveTask.Error and InteractiveTask.FileEditorError
+const INTERACTIVE_ERROR_MESSAGE_TYPES = [2, 102];
+export const decodeInteractiveLiveOutput = ({messageType, bytes, liveSequence, liveOffset}) => {
+    return {...decodeInteractiveBytes(bytes), is_error: INTERACTIVE_ERROR_MESSAGE_TYPES.includes(messageType), liveSequence, liveOffset};
+}
+// output from the live stream is shown as it arrived, both before its response comes from the database and after,
+// so the terminal only has to append when the response turns up rather than replay everything
+export const addInteractiveLiveOutput = (entries, live) => {
+    if(live === null){
+        return entries;
+    }
+    const savedByID = new Map(live.saved.map((saved) => [saved.responseID, saved]));
+    const shown = entries.flatMap((entry) => {
+        const saved = savedByID.get(entry.id);
+        if(saved === undefined){
+            // live output saved since the stream opened is already on screen, waiting to be matched to its response
+            const fromLiveOutput = entry.interactive_task_type !== undefined && entry.interactive_task_type !== null &&
+                entry.id > live.startResponseID;
+            return fromLiveOutput ? [] : [entry];
+        }
+        // the response changed after it was saved, like a full-screen app's output being collapsed
+        if(saved.byteLength !== entry.byteLength){
+            return [entry];
+        }
+        return saved.output.map((output, index) => ({
+            ...output,
+            id: index === saved.output.length - 1 ? entry.id : undefined,
+            timestamp: entry.timestamp,
+        }));
+    });
+    // responses arrive in order, so a saved one older than the newest loaded was since deleted
+    const newestID = entries.reduce((newest, entry) => typeof entry.id === "number" ? Math.max(newest, entry.id) : newest, 0);
+    const waiting = live.saved.filter((saved) => saved.responseID > newestID).flatMap((saved) => saved.output);
+    return [...shown, ...waiting, ...live.pending];
 }
 // rebuild a character split across two responses at the start of the later one, kept apart from its text so
 // the entry still matches what was written once the earlier response leaves the live window
@@ -233,6 +274,9 @@ export const getInteractiveTerminalAppendIndex = (previousSignatures, nextSignat
     return overlapLength;
 }
 const getInteractiveTerminalEntrySignature = (entry) => {
+    if(entry.liveSequence !== undefined){
+        return `live:${entry.liveSequence}`;
+    }
     if(entry.response !== undefined){
         return `response:${entry.id}:${entry.timestamp}:${entry.is_error}:${entry.response.length}`;
     }
@@ -304,6 +348,7 @@ const InteractiveTerminalDisplay = ({
     onTerminalResize,
     onScreenModeChange,
     startsInAlternateScreen,
+    onLiveOutputWritten,
 }) => {
     const terminalScrollContainerRef = React.useRef(null);
     const terminalElementRef = React.useRef(null);
@@ -322,6 +367,8 @@ const InteractiveTerminalDisplay = ({
     const onTerminalKeyEventRef = React.useRef(onTerminalKeyEvent);
     const onTerminalResizeRef = React.useRef(onTerminalResize);
     const onScreenModeChangeRef = React.useRef(onScreenModeChange);
+    const onLiveOutputWrittenRef = React.useRef(onLiveOutputWritten);
+    onLiveOutputWrittenRef.current = onLiveOutputWritten;
     const unwrappedColumnCountRef = React.useRef(0);
     const [terminalReady, setTerminalReady] = React.useState(false);
     const longestLineLength = React.useMemo( () => {
@@ -568,7 +615,11 @@ const InteractiveTerminalDisplay = ({
             startsInAlternateScreen,
             signatures: nextSignatures,
         };
+        const liveOffset = entriesToWrite.reduce((offset, entry) => Math.max(offset, entry.liveOffset || 0), 0);
         const afterWrite = () => {
+            if(liveOffset > 0){
+                onLiveOutputWrittenRef.current?.(liveOffset);
+            }
             const pendingLineInput = lineInputBufferRef.current;
             if(canSendInputRef.current && inputModeRef.current === "line" && pendingLineInput.length > 0){
                 terminal.write(pendingLineInput.replaceAll("\n", "\r\n"), () => {
@@ -624,7 +675,7 @@ const EnterOptions = [
     {"value": "\r", "name": "CR"},
     {"value": "\r\n", "name": "CRLF"}
 ];
-const RAW_PRINTABLE_BATCH_DELAY_MS = 150;
+const RAW_PRINTABLE_BATCH_DELAY_MS = 50;
 const PENDING_INPUT_EVENT_TTL_MS = 6000;
 const MAX_PENDING_INPUT_EVENTS = 10;
 const CONTROL_INPUTS_BY_DATA = {
@@ -763,9 +814,14 @@ export const ResponseDisplayInteractive = (props) =>{
     }, [screenRecordingsData]);
     const [playingRecordingFileID, setPlayingRecordingFileID] = React.useState(null);
     const collapsedRecordingIDsRef = React.useRef(null);
+    const [liveOutput, setLiveOutput] = React.useState(null);
+    const liveConnectionRef = React.useRef(null);
+    const [liveRetry, setLiveRetry] = React.useState(0);
+    const liveFailuresRef = React.useRef(0);
     const visibleOutput = React.useMemo( () => {
-        return addInteractiveScreenForcedExits(joinInteractiveSplitCharacters(sortInteractiveEntries(rawResponses)), screenRecordings);
-    }, [rawResponses, screenRecordings]);
+        const entries = addInteractiveLiveOutput(sortInteractiveEntries(rawResponses), liveOutput);
+        return addInteractiveScreenForcedExits(joinInteractiveSplitCharacters(entries), screenRecordings);
+    }, [liveOutput, rawResponses, screenRecordings]);
     const startsInAlternateScreen = React.useMemo( () => {
         const firstResponse = rawResponses.find((entry) => entry.response !== undefined);
         if(search !== "" || firstResponse === undefined){
@@ -1074,6 +1130,79 @@ export const ResponseDisplayInteractive = (props) =>{
         setAutoScroll(current => !current);
     }
     const canSendTerminalInput = !props.task?.is_interactive_task;
+    const watchLiveOutput = isLive && canSendTerminalInput && !props.task.completed;
+    React.useEffect( () => {
+        if(!watchLiveOutput){
+            return;
+        }
+        let retryTimer = null;
+        let saved = [];
+        let pending = [];
+        const live = {stream: null, canWrite: false, receivedBytes: 0, creditedBytes: 0, sequence: 0, startResponseID: 0};
+        const showLiveOutput = () => {
+            setLiveOutput({startResponseID: live.startResponseID, saved, pending});
+        };
+        live.stream = openInteractiveLiveStream(props.task.id, {
+            onOpened: ({responseID, canWrite}) => {
+                liveFailuresRef.current = 0;
+                live.startResponseID = responseID;
+                live.canWrite = canWrite;
+                liveConnectionRef.current = live;
+                showLiveOutput();
+            },
+            onOutput: (messageType, bytes) => {
+                live.receivedBytes += bytes.length;
+                pending = [...pending, decodeInteractiveLiveOutput({
+                    messageType,
+                    bytes,
+                    liveSequence: live.sequence++,
+                    liveOffset: live.receivedBytes,
+                })];
+                setPendingInputEvents((current) => current.length === 0 ? current : []);
+                showLiveOutput();
+            },
+            onSaved: (responseID) => {
+                // forget output whose response has left the live window
+                const oldestResponseID = rawResponsesRef.current[0]?.id || 0;
+                saved = saved.filter((response) => response.responseID >= oldestResponseID);
+                if(responseID > 0){
+                    saved = [...saved, {
+                        responseID,
+                        output: pending,
+                        byteLength: pending.reduce((length, output) => length + output.byteLength, 0),
+                    }];
+                }
+                pending = [];
+                showLiveOutput();
+            },
+            onInputError: (error) => {
+                snackActions.error("Failed to send interactive input: " + error);
+            },
+            onClosed: () => {
+                liveConnectionRef.current = null;
+                setLiveOutput(null);
+                // GraphQL keeps the output coming in the meantime
+                const retryDelay = Math.min(30000, 1000 * 2 ** liveFailuresRef.current);
+                liveFailuresRef.current += 1;
+                retryTimer = setTimeout(() => setLiveRetry((current) => current + 1), retryDelay);
+            },
+        });
+        return () => {
+            clearTimeout(retryTimer);
+            live.stream.close();
+            if(liveConnectionRef.current === live){
+                liveConnectionRef.current = null;
+            }
+            setLiveOutput(null);
+        };
+    }, [liveRetry, props.task.id, watchLiveOutput]);
+    const creditLiveOutput = React.useCallback( (liveOffset) => {
+        const live = liveConnectionRef.current;
+        if(live !== null && liveOffset > live.creditedBytes){
+            live.stream.credit(liveOffset - live.creditedBytes);
+            live.creditedBytes = liveOffset;
+        }
+    }, []);
     const sendInteractiveInput = React.useCallback( ({
         params,
         originalParams,
@@ -1084,6 +1213,14 @@ export const ResponseDisplayInteractive = (props) =>{
             return;
         }
         if(interactiveTaskType === 0 && (params === undefined || params === null || params === "")){
+            return;
+        }
+        addPendingInputEvent(pendingLabel || getTerminalInputLabel(originalParams !== undefined ? originalParams : params));
+        if(liveConnectionRef.current?.stream.sendInput({
+            params: params || "",
+            originalParams: originalParams !== undefined ? originalParams : params,
+            interactiveTaskType,
+        })){
             return;
         }
         createTask({variables: {
@@ -1098,7 +1235,6 @@ export const ResponseDisplayInteractive = (props) =>{
                 interactive_task_type: interactiveTaskType,
                 resolve_task_references: false,
             }});
-        addPendingInputEvent(pendingLabel || getTerminalInputLabel(originalParams !== undefined ? originalParams : params));
     }, [addPendingInputEvent, canSendTerminalInput, createTask, props.task.callback.display_id, props.task.command.cmd, props.task.display_id]);
     const sendTerminalData = React.useCallback( (terminalData) => {
         const controlInput = CONTROL_INPUTS_BY_DATA[terminalData];
@@ -1164,14 +1300,21 @@ export const ResponseDisplayInteractive = (props) =>{
             }
         };
     }, []);
+    // the first key goes straight away, then keys typed while it's on its way are sent together
     const queueRawPrintableInput = React.useCallback( (terminalData) => {
         rawPrintableInputBufferRef.current += terminalData;
         if(rawPrintableInputTimerRef.current !== null){
-            clearTimeout(rawPrintableInputTimerRef.current);
+            return;
         }
-        rawPrintableInputTimerRef.current = setTimeout(() => {
+        const sendBatch = () => {
+            if(rawPrintableInputBufferRef.current.length === 0){
+                rawPrintableInputTimerRef.current = null;
+                return;
+            }
             flushRawPrintableInput();
-        }, RAW_PRINTABLE_BATCH_DELAY_MS);
+            rawPrintableInputTimerRef.current = setTimeout(sendBatch, RAW_PRINTABLE_BATCH_DELAY_MS);
+        };
+        sendBatch();
     }, [flushRawPrintableInput]);
     const submitLineInput = React.useCallback( () => {
         const enterValue = EnterOptions[selectedEnterOption]?.value || "";
@@ -1375,7 +1518,8 @@ export const ResponseDisplayInteractive = (props) =>{
                                               onTerminalKeyEvent={handleTerminalKeyEvent}
                                               onTerminalResize={sendTerminalResize}
                                               onScreenModeChange={setScreenAlternate}
-                                              startsInAlternateScreen={startsInAlternateScreen}/>
+                                              startsInAlternateScreen={startsInAlternateScreen}
+                                              onLiveOutputWritten={creditLiveOutput}/>
               </div>
           </div>
 
