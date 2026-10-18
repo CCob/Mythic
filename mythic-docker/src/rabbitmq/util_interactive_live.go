@@ -26,6 +26,13 @@ type InteractiveLiveViewer interface {
 	InteractiveOutput(messageType InteractiveTask.MessageType, data []byte) bool
 	// InteractiveSaved means all output sent before it is now saved, ending with the response responseID
 	InteractiveSaved(responseID int) bool
+	// InteractiveSize is the size the task's terminal now has
+	InteractiveSize(size InteractiveLiveSize) bool
+}
+
+type InteractiveLiveSize struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
 }
 
 type interactiveLiveOutput struct {
@@ -42,6 +49,11 @@ type interactiveLiveTask struct {
 	saveTimer   *time.Timer
 	viewers     map[InteractiveLiveViewer]bool
 	lastActive  time.Time
+	// the terminal is as small as the smallest one showing it, so everyone sees all of it
+	sizes map[InteractiveLiveViewer]InteractiveLiveSize
+	size  InteractiveLiveSize
+	// resizes reach the agent one at a time, so it ends up the size worked out last
+	resizeLock sync.Mutex
 }
 
 var interactiveLiveTasks = struct {
@@ -89,7 +101,8 @@ func getInteractiveLiveTask(taskID int, agentTaskID string) (*interactiveLiveTas
 	if err := database.DB.Get(&task, query, lookup); err != nil {
 		return nil, err
 	}
-	liveTask := &interactiveLiveTask{task: task, viewers: make(map[InteractiveLiveViewer]bool), lastActive: time.Now()}
+	liveTask := &interactiveLiveTask{task: task, viewers: make(map[InteractiveLiveViewer]bool), lastActive: time.Now(),
+		sizes: make(map[InteractiveLiveViewer]InteractiveLiveSize)}
 	interactiveLiveTasks.tasks[task.ID] = liveTask
 	interactiveLiveTasks.agentTaskIDs[task.AgentTaskID] = task.ID
 	return liveTask, nil
@@ -187,26 +200,27 @@ func (liveTask *interactiveLiveTask) save() {
 }
 
 // WatchInteractiveTask saves the task's pending output, then sends the viewer everything after it. It returns the
-// id of the task's latest response so the viewer can load what came before from the database.
-func WatchInteractiveTask(taskID int, operationID int, viewer InteractiveLiveViewer) (int, error) {
+// id of the task's latest response so the viewer can load what came before from the database, and the size of the
+// task's terminal if it's known.
+func WatchInteractiveTask(taskID int, operationID int, viewer InteractiveLiveViewer) (int, InteractiveLiveSize, error) {
 	liveTask, err := getInteractiveLiveTask(taskID, "")
 	if err != nil {
-		return 0, err
+		return 0, InteractiveLiveSize{}, err
 	}
 	liveTask.Lock()
 	defer liveTask.Unlock()
 	if liveTask.task.OperationID != operationID {
-		return 0, errors.New("task isn't in the current operation")
+		return 0, InteractiveLiveSize{}, errors.New("task isn't in the current operation")
 	}
 	liveTask.save()
 	latestResponseID := 0
 	if err = database.DB.Get(&latestResponseID, `SELECT COALESCE(max(id), 0) FROM response WHERE task_id=$1`,
 		taskID); err != nil {
-		return 0, err
+		return 0, InteractiveLiveSize{}, err
 	}
 	liveTask.viewers[viewer] = true
 	liveTask.lastActive = time.Now()
-	return latestResponseID, nil
+	return latestResponseID, liveTask.size, nil
 }
 
 func UnwatchInteractiveTask(taskID int, viewer InteractiveLiveViewer) {
@@ -219,6 +233,66 @@ func UnwatchInteractiveTask(taskID int, viewer InteractiveLiveViewer) {
 	liveTask.Lock()
 	delete(liveTask.viewers, viewer)
 	liveTask.Unlock()
+}
+
+// ResizeInteractiveTask records the size a viewer's terminal can show, or forgets it when size is nil, such as
+// when the viewer leaves. If that changes the size the task should be, every viewer is told and apply is called to
+// resize the agent's terminal, along with the viewer whose request caused it or, if that viewer left, one that's
+// still sizing the terminal.
+func ResizeInteractiveTask(taskID int, viewer InteractiveLiveViewer, size *InteractiveLiveSize,
+	apply func(owner InteractiveLiveViewer, size InteractiveLiveSize)) {
+	interactiveLiveTasks.Lock()
+	liveTask, ok := interactiveLiveTasks.tasks[taskID]
+	interactiveLiveTasks.Unlock()
+	if !ok {
+		return
+	}
+	liveTask.resizeLock.Lock()
+	defer liveTask.resizeLock.Unlock()
+	owner, newSize, changed := liveTask.setViewerSize(viewer, size)
+	if changed {
+		apply(owner, newSize)
+	}
+}
+
+func (liveTask *interactiveLiveTask) setViewerSize(viewer InteractiveLiveViewer, size *InteractiveLiveSize) (InteractiveLiveViewer, InteractiveLiveSize, bool) {
+	liveTask.Lock()
+	defer liveTask.Unlock()
+	if size == nil {
+		delete(liveTask.sizes, viewer)
+	} else {
+		liveTask.sizes[viewer] = *size
+	}
+	// with nobody left sizing it, the terminal stays as it is
+	if len(liveTask.sizes) == 0 {
+		return nil, liveTask.size, false
+	}
+	newSize := InteractiveLiveSize{}
+	owner := viewer
+	if size == nil {
+		owner = nil
+	}
+	for sizingViewer, viewerSize := range liveTask.sizes {
+		if newSize.Cols == 0 || viewerSize.Cols < newSize.Cols {
+			newSize.Cols = viewerSize.Cols
+		}
+		if newSize.Rows == 0 || viewerSize.Rows < newSize.Rows {
+			newSize.Rows = viewerSize.Rows
+		}
+		if owner == nil {
+			owner = sizingViewer
+		}
+	}
+	if newSize == liveTask.size {
+		return nil, newSize, false
+	}
+	liveTask.size = newSize
+	for watchingViewer := range liveTask.viewers {
+		if !watchingViewer.InteractiveSize(newSize) {
+			delete(liveTask.viewers, watchingViewer)
+		}
+	}
+	return owner, newSize, true
 }
 
 // saveInteractiveLiveTask saves any output still pending for the task, such as when its session ends
@@ -240,7 +314,8 @@ func forgetIdleInteractiveLiveTasks() {
 	defer interactiveLiveTasks.Unlock()
 	for taskID, liveTask := range interactiveLiveTasks.tasks {
 		liveTask.Lock()
-		if len(liveTask.viewers) == 0 && len(liveTask.pending) == 0 && time.Since(liveTask.lastActive) > interactiveLiveIdleTime {
+		if len(liveTask.viewers) == 0 && len(liveTask.sizes) == 0 && len(liveTask.pending) == 0 &&
+			time.Since(liveTask.lastActive) > interactiveLiveIdleTime {
 			delete(interactiveLiveTasks.tasks, taskID)
 			delete(interactiveLiveTasks.agentTaskIDs, liveTask.task.AgentTaskID)
 		}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/its-a-feature/Mythic/database/enums/InteractiveTask"
+	"github.com/its-a-feature/Mythic/rabbitmq"
 )
 
 func newTestInteractiveLiveStream() (*interactiveLiveConnection, *interactiveLiveStream) {
@@ -67,6 +68,15 @@ func TestInteractiveLiveClosesStreamsThatFallTooFarBehind(t *testing.T) {
 	}
 	if _, ok := connection.streams[7]; ok {
 		t.Fatal("closed stream wasn't removed")
+	}
+}
+
+func TestInteractiveLiveSizeMessage(t *testing.T) {
+	connection, stream := newTestInteractiveLiveStream()
+	stream.InteractiveSize(rabbitmq.InteractiveLiveSize{Cols: 80, Rows: 24})
+	frames := connection.takeFrames()
+	if len(frames) != 1 || string(frames[0].data) != `{"type":"size","channel":7,"cols":80,"rows":24}` {
+		t.Fatalf("frames = %v", frames)
 	}
 }
 

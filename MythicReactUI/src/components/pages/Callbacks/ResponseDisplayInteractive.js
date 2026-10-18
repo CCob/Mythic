@@ -349,6 +349,7 @@ const InteractiveTerminalDisplay = ({
     onScreenModeChange,
     startsInAlternateScreen,
     onLiveOutputWritten,
+    sharedSize,
 }) => {
     const terminalScrollContainerRef = React.useRef(null);
     const terminalElementRef = React.useRef(null);
@@ -369,6 +370,9 @@ const InteractiveTerminalDisplay = ({
     const onScreenModeChangeRef = React.useRef(onScreenModeChange);
     const onLiveOutputWrittenRef = React.useRef(onLiveOutputWritten);
     onLiveOutputWrittenRef.current = onLiveOutputWritten;
+    // the size everyone watching the task can show, which the terminal is drawn at instead of filling its space
+    const sharedSizeRef = React.useRef(sharedSize);
+    sharedSizeRef.current = sharedSize;
     const unwrappedColumnCountRef = React.useRef(0);
     const [terminalReady, setTerminalReady] = React.useState(false);
     const longestLineLength = React.useMemo( () => {
@@ -388,17 +392,23 @@ const InteractiveTerminalDisplay = ({
             if(!proposedDimensions){
                 return;
             }
-            const rows = Math.max(1, proposedDimensions.rows);
+            const visibleRows = Math.max(1, proposedDimensions.rows);
             const visibleCols = Math.max(1, proposedDimensions.cols);
+            const sharedSize = sharedSizeRef.current;
+            const rows = sharedSize ? sharedSize.rows : visibleRows;
             if(wrapTextRef.current || terminal.buffer.active.type === "alternate"){
-                fitAddon.fit();
+                if(sharedSize){
+                    terminal.resize(sharedSize.cols, sharedSize.rows);
+                } else {
+                    fitAddon.fit();
+                }
                 scrollContainer.scrollLeft = 0;
             } else {
-                const cols = Math.max(visibleCols, unwrappedColumnCountRef.current);
+                const cols = Math.max(sharedSize ? sharedSize.cols : visibleCols, unwrappedColumnCountRef.current);
                 terminalElement.style.width = `${Math.ceil((cols / visibleCols) * scrollContainer.clientWidth)}px`;
                 terminal.resize(cols, rows);
             }
-            onTerminalResizeRef.current?.(visibleCols, rows);
+            onTerminalResizeRef.current?.(visibleCols, visibleRows);
         }catch(error){
             console.error(error);
         }
@@ -442,6 +452,9 @@ const InteractiveTerminalDisplay = ({
         wrapTextRef.current = wrapText;
         scheduleFitTerminal();
     }, [wrapText, scheduleFitTerminal]);
+    React.useEffect( () => {
+        scheduleFitTerminal();
+    }, [sharedSize, scheduleFitTerminal]);
     React.useEffect( () => {
         canSendInputRef.current = canSendInput;
         if(terminalRef.current){
@@ -817,6 +830,9 @@ export const ResponseDisplayInteractive = (props) =>{
     const [liveOutput, setLiveOutput] = React.useState(null);
     const liveConnectionRef = React.useRef(null);
     const [liveRetry, setLiveRetry] = React.useState(0);
+    const [liveSize, setLiveSize] = React.useState(null);
+    // how much of the terminal fits on screen here, whether or not it's been sent
+    const fitSizeRef = React.useRef(null);
     const liveFailuresRef = React.useRef(0);
     const visibleOutput = React.useMemo( () => {
         const entries = addInteractiveLiveOutput(sortInteractiveEntries(rawResponses), liveOutput);
@@ -1143,12 +1159,28 @@ export const ResponseDisplayInteractive = (props) =>{
             setLiveOutput({startResponseID: live.startResponseID, saved, pending});
         };
         live.stream = openInteractiveLiveStream(props.task.id, {
-            onOpened: ({responseID, canWrite}) => {
+            onOpened: ({responseID, canWrite, size}) => {
                 liveFailuresRef.current = 0;
                 live.startResponseID = responseID;
                 live.canWrite = canWrite;
                 liveConnectionRef.current = live;
+                setLiveSize(size);
+                // the server forgets a viewer's size when its stream closes, so a new stream sends it again
+                const fitSize = fitSizeRef.current;
+                if(canWrite && fitSize !== null){
+                    clearTimeout(resizeTimerRef.current);
+                    resizeTimerRef.current = null;
+                    lastResizeRef.current = fitSize;
+                    live.stream.sendInput({
+                        params: `${fitSize.cols},${fitSize.rows},0,0`,
+                        originalParams: `resize ${fitSize.cols}x${fitSize.rows}`,
+                        interactiveTaskType: 25, // InteractiveTask.WindowChange
+                    });
+                }
                 showLiveOutput();
+            },
+            onSize: (size) => {
+                setLiveSize(size);
             },
             onOutput: (messageType, bytes) => {
                 live.receivedBytes += bytes.length;
@@ -1181,6 +1213,7 @@ export const ResponseDisplayInteractive = (props) =>{
             onClosed: () => {
                 liveConnectionRef.current = null;
                 setLiveOutput(null);
+                setLiveSize(null);
                 // GraphQL keeps the output coming in the meantime
                 const retryDelay = Math.min(30000, 1000 * 2 ** liveFailuresRef.current);
                 liveFailuresRef.current += 1;
@@ -1194,6 +1227,7 @@ export const ResponseDisplayInteractive = (props) =>{
                 liveConnectionRef.current = null;
             }
             setLiveOutput(null);
+            setLiveSize(null);
         };
     }, [liveRetry, props.task.id, watchLiveOutput]);
     const creditLiveOutput = React.useCallback( (liveOffset) => {
@@ -1274,6 +1308,7 @@ export const ResponseDisplayInteractive = (props) =>{
         if(!canSendTerminalInput){
             return;
         }
+        fitSizeRef.current = {cols, rows};
         if(lastResizeRef.current.cols === cols && lastResizeRef.current.rows === rows){
             return;
         }
@@ -1519,7 +1554,8 @@ export const ResponseDisplayInteractive = (props) =>{
                                               onTerminalResize={sendTerminalResize}
                                               onScreenModeChange={setScreenAlternate}
                                               startsInAlternateScreen={startsInAlternateScreen}
-                                              onLiveOutputWritten={creditLiveOutput}/>
+                                              onLiveOutputWritten={creditLiveOutput}
+                                              sharedSize={liveSize}/>
               </div>
           </div>
 

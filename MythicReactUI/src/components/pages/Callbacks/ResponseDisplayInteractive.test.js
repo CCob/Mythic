@@ -636,5 +636,14 @@ describe("ResponseDisplayInteractive", () => {
         await streamResponse({id: 11, response: encode("ls\r\nfile\r\n"), timestamp: "2026-10-15T09:00:01", is_error: false, interactive_task_type: 1});
         expect(lines()).toEqual(["$ ls", "file"]);
         expect(reset).not.toHaveBeenCalled();
+
+        // someone else watching has a smaller window, so the terminal is drawn at the size that fits everyone
+        await act(async () => {
+            stream.handlers.onSize({cols: 80, rows: 20});
+        });
+        await settle();
+        expect([global.mockTerminal.cols, global.mockTerminal.rows]).toEqual([80, 20]);
+        // while still saying how much fits here
+        expect(stream.inputs).toHaveLength(1);
     });
 });

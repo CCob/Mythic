@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -61,6 +62,8 @@ type interactiveLiveServerMessage struct {
 	Channel    uint32 `json:"channel"`
 	ResponseID int    `json:"response_id,omitempty"`
 	CanWrite   bool   `json:"can_write,omitempty"`
+	Cols       int    `json:"cols,omitempty"`
+	Rows       int    `json:"rows,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
@@ -162,7 +165,7 @@ func (connection *interactiveLiveConnection) read() {
 		connection.streams = map[uint32]*interactiveLiveStream{}
 		connection.Unlock()
 		for _, stream := range streams {
-			rabbitmq.UnwatchInteractiveTask(stream.task.ID, stream)
+			stream.leave()
 		}
 		connection.conn.Close()
 	}()
@@ -211,7 +214,7 @@ func (connection *interactiveLiveConnection) open(message interactiveLiveClientM
 		connection.send(message.Channel, interactiveLiveServerMessage{Type: "closed", Reason: "stream unavailable"})
 		return
 	}
-	responseID, err := stream.watch(message.TaskID)
+	responseID, size, err := stream.watch(message.TaskID)
 	if err != nil {
 		connection.Lock()
 		delete(connection.streams, message.Channel)
@@ -221,7 +224,7 @@ func (connection *interactiveLiveConnection) open(message interactiveLiveClientM
 	}
 	// output may already be queued behind it, so this goes first
 	opened, _ := json.Marshal(interactiveLiveServerMessage{Type: "opened", Channel: message.Channel,
-		ResponseID: responseID, CanWrite: connection.canWrite})
+		ResponseID: responseID, CanWrite: connection.canWrite, Cols: size.Cols, Rows: size.Rows})
 	connection.Lock()
 	stream.queue = append([]interactiveLiveFrame{{messageType: websocket.TextMessage, data: opened}}, stream.queue...)
 	stream.opening = false
@@ -229,10 +232,10 @@ func (connection *interactiveLiveConnection) open(message interactiveLiveClientM
 	connection.signal()
 }
 
-func (stream *interactiveLiveStream) watch(taskID int) (int, error) {
+func (stream *interactiveLiveStream) watch(taskID int) (int, rabbitmq.InteractiveLiveSize, error) {
 	operatorOperation, err := database.GetUserCurrentOperation(stream.connection.claims.UserID)
 	if err != nil {
-		return 0, errors.New("failed to get current operation")
+		return 0, rabbitmq.InteractiveLiveSize{}, errors.New("failed to get current operation")
 	}
 	if err = database.DB.Get(&stream.task, `SELECT
 		task.id, task.operation_id, callback.display_id "callback_display_id",
@@ -241,7 +244,7 @@ func (stream *interactiveLiveStream) watch(taskID int) (int, error) {
 		JOIN callback ON task.callback_id = callback.id
 		LEFT JOIN command ON task.command_id = command.id
 		WHERE task.id=$1 AND task.operation_id=$2`, taskID, operatorOperation.CurrentOperation.ID); err != nil {
-		return 0, errors.New("task not found in current operation")
+		return 0, rabbitmq.InteractiveLiveSize{}, errors.New("task not found in current operation")
 	}
 	return rabbitmq.WatchInteractiveTask(stream.task.ID, stream.task.OperationID, stream)
 }
@@ -255,7 +258,7 @@ func (connection *interactiveLiveConnection) closeStream(channel uint32) {
 	delete(connection.streams, channel)
 	connection.Unlock()
 	if ok {
-		rabbitmq.UnwatchInteractiveTask(stream.task.ID, stream)
+		stream.leave()
 	}
 }
 
@@ -268,7 +271,6 @@ func (connection *interactiveLiveConnection) credit(channel uint32, size int) {
 	connection.signal()
 }
 
-// input is tasked the same way as the createTask mutation, just without the trip through GraphQL
 func (connection *interactiveLiveConnection) input(message interactiveLiveClientMessage) {
 	connection.Lock()
 	stream, ok := connection.streams[message.Channel]
@@ -276,23 +278,55 @@ func (connection *interactiveLiveConnection) input(message interactiveLiveClient
 	if !ok {
 		return
 	}
-	inputError := func(err string) {
-		connection.send(message.Channel, interactiveLiveServerMessage{Type: "input_error", Error: err})
+	if InteractiveTask.MessageType(message.InteractiveTaskType) == InteractiveTask.WindowChange {
+		stream.resize(message.Params)
+		return
 	}
+	if err := stream.task.createInput(stream, message.InteractiveTaskType, message.Params, message.OriginalParams); err != nil {
+		connection.send(message.Channel, interactiveLiveServerMessage{Type: "input_error", Error: err.Error()})
+	}
+}
+
+// resize records how much of the terminal this viewer can show. Only viewers that can send input size it; the
+// rest show it at whatever size it is.
+func (stream *interactiveLiveStream) resize(params string) {
+	if !stream.connection.canWrite {
+		return
+	}
+	size := rabbitmq.InteractiveLiveSize{}
+	if _, err := fmt.Sscanf(params, "%d,%d", &size.Cols, &size.Rows); err != nil || size.Cols <= 0 || size.Rows <= 0 {
+		return
+	}
+	rabbitmq.ResizeInteractiveTask(stream.task.ID, stream, &size, applyInteractiveLiveResize)
+}
+
+// applyInteractiveLiveResize resizes the agent's terminal as the viewer whose size it's now using
+func applyInteractiveLiveResize(owner rabbitmq.InteractiveLiveViewer, size rabbitmq.InteractiveLiveSize) {
+	ownerStream, ok := owner.(*interactiveLiveStream)
+	if !ok {
+		return
+	}
+	params := fmt.Sprintf("%d,%d,0,0", size.Cols, size.Rows)
+	if err := ownerStream.task.createInput(ownerStream, int(InteractiveTask.WindowChange), params,
+		fmt.Sprintf("resize %dx%d", size.Cols, size.Rows)); err != nil {
+		logging.LogError(err, "Failed to resize interactive task", "task_id", ownerStream.task.ID)
+	}
+}
+
+// createInput tasks input the same way as the createTask mutation, just without the trip through GraphQL
+func (task interactiveLiveTask) createInput(stream *interactiveLiveStream, interactiveTaskType int, params string, originalParams string) error {
+	connection := stream.connection
 	if !connection.canWrite {
-		inputError("Not allowed to send input")
-		return
+		return errors.New("Not allowed to send input")
 	}
-	if !InteractiveTask.IsValid(message.InteractiveTaskType) {
-		inputError("Unknown interactive task type")
-		return
+	if !InteractiveTask.IsValid(interactiveTaskType) {
+		return errors.New("Unknown interactive task type")
 	}
 	// the user may have changed operation or been removed from it since connecting
 	operatorOperation, err := database.GetUserCurrentOperation(connection.claims.UserID)
 	if err != nil || !operatorOperation.CurrentOperator.Active || operatorOperation.CurrentOperator.Deleted ||
-		!interactiveLiveCanWrite(operatorOperation) || operatorOperation.CurrentOperation.ID != stream.task.OperationID {
-		inputError("Not allowed to send input to this task")
-		return
+		!interactiveLiveCanWrite(operatorOperation) || operatorOperation.CurrentOperation.ID != task.OperationID {
+		return errors.New("Not allowed to send input to this task")
 	}
 	taskingLocation := "command_line"
 	parameterGroupName := "default"
@@ -300,18 +334,18 @@ func (connection *interactiveLiveConnection) input(message interactiveLiveClient
 	authContext := connection.authContext
 	authContext.ContextID = uuid.NewString()
 	createTaskInput := rabbitmq.CreateTaskInput{
-		CallbackDisplayID:     stream.task.CallbackDisplayID,
+		CallbackDisplayID:     task.CallbackDisplayID,
 		CurrentOperationID:    operatorOperation.CurrentOperation.ID,
 		OperatorID:            operatorOperation.CurrentOperator.ID,
 		IsOperatorAdmin:       operatorOperation.CurrentOperator.Admin,
-		CommandName:           stream.task.Command,
-		Params:                message.Params,
+		CommandName:           task.Command,
+		Params:                params,
 		TaskingLocation:       &taskingLocation,
-		OriginalParams:        &message.OriginalParams,
+		OriginalParams:        &originalParams,
 		ParameterGroupName:    &parameterGroupName,
-		ParentTaskID:          &stream.task.ID,
+		ParentTaskID:          &task.ID,
 		IsInteractiveTask:     true,
-		InteractiveTaskType:   &message.InteractiveTaskType,
+		InteractiveTaskType:   &interactiveTaskType,
 		EventStepInstanceID:   connection.claims.EventStepInstanceID,
 		APITokensID:           connection.claims.APITokensID,
 		ResolveTaskReferences: &resolveTaskReferences,
@@ -322,8 +356,9 @@ func (connection *interactiveLiveConnection) input(message interactiveLiveClient
 		createTaskInput.DisabledCommandID = &baseDisabledCommandsID
 	}
 	if response := rabbitmq.CreateTask(createTaskInput); response.Status == "error" {
-		inputError(response.Error)
+		return errors.New(response.Error)
 	}
+	return nil
 }
 
 // send queues a control message on a stream, or straight to the browser if the stream doesn't exist
@@ -354,6 +389,17 @@ func (stream *interactiveLiveStream) InteractiveOutput(messageType InteractiveTa
 	frame[4] = byte(messageType)
 	copy(frame[5:], data)
 	return stream.enqueue(interactiveLiveFrame{messageType: websocket.BinaryMessage, data: frame, size: len(data)})
+}
+
+func (stream *interactiveLiveStream) InteractiveSize(size rabbitmq.InteractiveLiveSize) bool {
+	data, _ := json.Marshal(interactiveLiveServerMessage{Type: "size", Channel: stream.channel, Cols: size.Cols, Rows: size.Rows})
+	return stream.enqueue(interactiveLiveFrame{messageType: websocket.TextMessage, data: data})
+}
+
+// leave stops watching the task, and stops this viewer's size counting towards it
+func (stream *interactiveLiveStream) leave() {
+	rabbitmq.UnwatchInteractiveTask(stream.task.ID, stream)
+	rabbitmq.ResizeInteractiveTask(stream.task.ID, stream, nil, applyInteractiveLiveResize)
 }
 
 func (stream *interactiveLiveStream) InteractiveSaved(responseID int) bool {
@@ -439,6 +485,8 @@ func (connection *interactiveLiveConnection) takeFrames() []interactiveLiveFrame
 		stream.queue = stream.queue[sent:]
 		if stream.closed && len(stream.queue) == 0 {
 			delete(connection.streams, channel)
+			// a stream closed for falling behind is replaced by a new one, so its size no longer counts
+			go stream.leave()
 		}
 	}
 	return frames

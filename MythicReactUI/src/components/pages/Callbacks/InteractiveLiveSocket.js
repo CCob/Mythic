@@ -56,7 +56,14 @@ const handleLiveMessage = (event) => {
     switch(message.type){
         case "opened":
             stream.canWrite = message.can_write === true;
-            stream.onOpened?.({responseID: message.response_id || 0, canWrite: stream.canWrite});
+            stream.onOpened?.({
+                responseID: message.response_id || 0,
+                canWrite: stream.canWrite,
+                size: message.cols > 0 && message.rows > 0 ? {cols: message.cols, rows: message.rows} : null,
+            });
+            break;
+        case "size":
+            stream.onSize?.({cols: message.cols, rows: message.rows});
             break;
         case "saved":
             stream.onSaved?.(message.response_id || 0);
@@ -103,10 +110,11 @@ const closeWhenIdle = () => {
     }, IDLE_CLOSE_DELAY_MS);
 }
 
-// openInteractiveLiveStream watches a task's output. Handlers: onOpened({responseID, canWrite}) once output from
-// after response responseID will follow, onOutput(messageType, bytes), onSaved(responseID) once the output so far
-// is saved as that response (0 if it couldn't be saved), onInputError(error), and onClosed(reason) when the
-// stream ends for any reason other than calling close().
+// openInteractiveLiveStream watches a task's output. Handlers: onOpened({responseID, canWrite, size}) once output
+// from after response responseID will follow, onOutput(messageType, bytes), onSaved(responseID) once the output so
+// far is saved as that response (0 if it couldn't be saved), onSize({cols, rows}) when the terminal's size changes
+// because of what everyone watching can show, onInputError(error), and onClosed(reason) when the stream ends for
+// any reason other than calling close().
 export const openInteractiveLiveStream = (taskID, handlers) => {
     const channel = nextChannel++;
     const stream = {taskID, canWrite: false, ...handlers};

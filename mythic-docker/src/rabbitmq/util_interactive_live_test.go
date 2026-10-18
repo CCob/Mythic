@@ -32,6 +32,13 @@ func (viewer *fakeInteractiveLiveViewer) InteractiveSaved(responseID int) bool {
 	return !viewer.refuse
 }
 
+func (viewer *fakeInteractiveLiveViewer) InteractiveSize(size InteractiveLiveSize) bool {
+	viewer.Lock()
+	defer viewer.Unlock()
+	viewer.events = append(viewer.events, fmt.Sprintf("size %dx%d", size.Cols, size.Rows))
+	return !viewer.refuse
+}
+
 func (viewer *fakeInteractiveLiveViewer) getEvents() []string {
 	viewer.Lock()
 	defer viewer.Unlock()
@@ -68,6 +75,7 @@ func newTestInteractiveLiveTask(t *testing.T) (*interactiveLiveTask, *fakeIntera
 	liveTask := &interactiveLiveTask{
 		task:    databaseStructs.Task{ID: 1, OperationID: 1},
 		viewers: map[InteractiveLiveViewer]bool{viewer: true},
+		sizes:   map[InteractiveLiveViewer]InteractiveLiveSize{},
 	}
 	return liveTask, viewer, func() []savedInteractiveLiveResponse {
 			lock.Lock()
@@ -143,5 +151,38 @@ func TestInteractiveLiveDropsViewersThatRefuseOutput(t *testing.T) {
 	liveTask.addOutput(InteractiveTask.Output, []byte("b"))
 	if got := viewer.getEvents(); !slices.Equal(got, []string{"1:a"}) {
 		t.Fatalf("viewer events = %q", got)
+	}
+}
+
+func TestInteractiveLiveSizesTheTerminalToFitEveryone(t *testing.T) {
+	liveTask, watcher, _, _ := newTestInteractiveLiveTask(t)
+	small, large := &fakeInteractiveLiveViewer{}, &fakeInteractiveLiveViewer{}
+	resize := func(viewer InteractiveLiveViewer, size *InteractiveLiveSize) string {
+		owner, newSize, changed := liveTask.setViewerSize(viewer, size)
+		if !changed {
+			return "unchanged"
+		}
+		return fmt.Sprintf("%dx%d by %s", newSize.Cols, newSize.Rows, map[InteractiveLiveViewer]string{small: "small", large: "large"}[owner])
+	}
+	if got := resize(large, &InteractiveLiveSize{Cols: 200, Rows: 50}); got != "200x50 by large" {
+		t.Fatalf("first viewer: %s", got)
+	}
+	// each dimension is the smallest anyone asked for
+	if got := resize(small, &InteractiveLiveSize{Cols: 80, Rows: 60}); got != "80x50 by small" {
+		t.Fatalf("second viewer: %s", got)
+	}
+	if got := resize(large, &InteractiveLiveSize{Cols: 220, Rows: 50}); got != "unchanged" {
+		t.Fatalf("growing past the smallest: %s", got)
+	}
+	// once the smallest viewer leaves, the terminal grows and is resized as someone still there
+	if got := resize(small, nil); got != "220x50 by large" {
+		t.Fatalf("smallest left: %s", got)
+	}
+	if got := resize(large, nil); got != "unchanged" {
+		t.Fatalf("last viewer left: %s", got)
+	}
+	// everyone watching is told, whether or not they size it
+	if got := watcher.getEvents(); !slices.Equal(got, []string{"size 200x50", "size 80x50", "size 220x50"}) {
+		t.Fatalf("watcher events = %q", got)
 	}
 }
