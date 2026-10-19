@@ -3,7 +3,9 @@ package rabbitmq
 import (
 	"encoding/base64"
 	"errors"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +74,31 @@ type interactiveLiveDelivery struct {
 	CommandPayloadType  string                          `db:"command_payload_type"`
 	SupportedUIFeatures databaseStructs.MythicJSONArray `db:"supported_ui_features"`
 	processesInput      bool
+}
+
+// mouse reports, SGR ones as ESC[<button;col;row then M or m, and X10 ones as ESC[M then three bytes
+var interactiveLiveMouseReportRegex = regexp.MustCompile(`\x1b\[<(\d+);\d+;\d+[Mm]|\x1b\[M([\x20-\x7f])[\x20-\x7f]{2}`)
+
+// withoutInteractiveHover removes reports of the pointer moving with no button held. They're still sent to apps
+// tracking every movement, which use them to highlight what's under the pointer, but they don't do anything, so
+// they're left out of what's saved.
+func withoutInteractiveHover(params string) string {
+	if !strings.Contains(params, "\x1b[") {
+		return params
+	}
+	return interactiveLiveMouseReportRegex.ReplaceAllStringFunc(params, func(report string) string {
+		match := interactiveLiveMouseReportRegex.FindStringSubmatch(report)
+		button := 0
+		if match[1] != "" {
+			button, _ = strconv.Atoi(match[1])
+		} else {
+			button = int(match[2][0]) - 32
+		}
+		if button&32 != 0 && button&64 == 0 && button&3 == 3 {
+			return ""
+		}
+		return report
+	})
 }
 
 type interactiveLiveInputBatch struct {
@@ -219,6 +246,13 @@ func (liveTask *interactiveLiveTask) addInput(viewer InteractiveLiveViewer, inpu
 	}
 	controlBytes, isControl := interactiveLiveInputControlBytes[input.MessageType]
 	inLine := input.MessageType == InteractiveTask.Input || isControl
+	if input.MessageType == InteractiveTask.Input {
+		params := withoutInteractiveHover(input.Params)
+		if params == "" && input.Params != "" {
+			return
+		}
+		input.Params = params
+	}
 	batch, ok := liveTask.inputs[viewer]
 	if ok && (!inLine || batch.input.OperatorID != input.OperatorID || batch.input.APITokensID != input.APITokensID) {
 		liveTask.saveInput(viewer)
@@ -280,7 +314,6 @@ func (liveTask *interactiveLiveTask) saveInput(viewer InteractiveLiveViewer) {
 		Params:             batch.params.String(),
 		OriginalParams:     batch.originalParams.String(),
 		DisplayParams:      batch.params.String(),
-		MythicParsedParams: batch.params.String(),
 		Status:             PT_TASK_FUNCTION_STATUS_COMPLETED,
 		Completed:          true,
 		TaskingLocation:    "command_line",

@@ -345,6 +345,7 @@ const InteractiveTerminalDisplay = ({
     lineInputBuffer,
     onTerminalInput,
     onTerminalKeyEvent,
+    onTerminalMouse,
     onTerminalResize,
     onScreenModeChange,
     startsInAlternateScreen,
@@ -366,6 +367,8 @@ const InteractiveTerminalDisplay = ({
     const localEchoVisibleRef = React.useRef(false);
     const onTerminalInputRef = React.useRef(onTerminalInput);
     const onTerminalKeyEventRef = React.useRef(onTerminalKeyEvent);
+    const onTerminalMouseRef = React.useRef(onTerminalMouse);
+    onTerminalMouseRef.current = onTerminalMouse;
     const onTerminalResizeRef = React.useRef(onTerminalResize);
     const onScreenModeChangeRef = React.useRef(onScreenModeChange);
     const onLiveOutputWrittenRef = React.useRef(onLiveOutputWritten);
@@ -503,11 +506,26 @@ const InteractiveTerminalDisplay = ({
             disableStdin: !canSendInputRef.current,
             fontFamily: 'Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
             fontSize: 13,
+            // apps tracking the mouse get the clicks, so Option-click still selects on macOS as Shift does elsewhere
+            macOptionClickForcesSelection: true,
             scrollback: INTERACTIVE_TERMINAL_SCROLLBACK,
             theme: getInteractiveTerminalTheme(theme),
         });
         const keyDisposable = terminal.onKey(({key}) => {
             writeLocalTerminalAction(onTerminalInputRef.current?.(key));
+        });
+        // apps that turn on mouse tracking get clicks, drags and the wheel as escape sequences. Keys come from onKey.
+        const mouseDataDisposable = terminal.onData((data) => {
+            if(parseTerminalMouseReport(data)){
+                onTerminalMouseRef.current?.(data);
+            }
+        });
+        // X10 reports are bytes rather than text, which can only be sent while they're ASCII (up to column 95)
+        const mouseBinaryDisposable = terminal.onBinary((data) => {
+            // eslint-disable-next-line no-control-regex
+            if(parseTerminalMouseReport(data) && /^[\x00-\x7f]*$/.test(data)){
+                onTerminalMouseRef.current?.(data);
+            }
         });
         // alternate screen buffer (ESC[?1049h etc) means a full-screen app is running
         const bufferChangeDisposable = terminal.buffer.onBufferChange((buffer) => {
@@ -578,6 +596,8 @@ const InteractiveTerminalDisplay = ({
             terminalRef.current = null;
             terminalElement.removeEventListener("paste", handleTerminalPaste);
             keyDisposable.dispose();
+            mouseDataDisposable.dispose();
+            mouseBinaryDisposable.dispose();
             bufferChangeDisposable.dispose();
             terminal.dispose();
         }
@@ -737,6 +757,42 @@ const TERMINAL_KEY_EVENT_INPUTS = {
     PageUp: "\x1b[5~",
     PageDown: "\x1b[6~",
 };
+// SGR mouse reports are ESC[<button;col;row ending in M, or m for a release. X10 ones are ESC[M and three bytes.
+// eslint-disable-next-line no-control-regex
+const TERMINAL_MOUSE_SGR_REGEX = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+// eslint-disable-next-line no-control-regex
+const TERMINAL_MOUSE_X10_REGEX = /^\x1b\[M([\s\S])([\s\S])([\s\S])$/;
+const TERMINAL_MOUSE_BUTTONS = ["Click", "Middle click", "Right click"];
+const TERMINAL_MOUSE_WHEEL = ["Wheel up", "Wheel down", "Wheel left", "Wheel right"];
+// parseTerminalMouseReport returns a label for a mouse report, whether it's only the pointer moving, and whether it's
+// moving with no button held, which apps tracking every movement use to highlight what's under the pointer
+export const parseTerminalMouseReport = (data) => {
+    let button, col, row, released;
+    const sgrMatch = TERMINAL_MOUSE_SGR_REGEX.exec(data);
+    const x10Match = sgrMatch ? null : TERMINAL_MOUSE_X10_REGEX.exec(data);
+    if(sgrMatch){
+        [button, col, row] = [Number(sgrMatch[1]), Number(sgrMatch[2]), Number(sgrMatch[3])];
+        released = sgrMatch[4] === "m";
+    } else if(x10Match){
+        [button, col, row] = [x10Match[1], x10Match[2], x10Match[3]].map((value) => value.charCodeAt(0) - 32);
+        // X10 has no release, just a press of button 3
+        released = (button & 3) === 3 && (button & 96) === 0;
+    } else {
+        return null;
+    }
+    const motion = (button & 32) !== 0 && (button & 64) === 0;
+    let label;
+    if(button & 64){
+        label = TERMINAL_MOUSE_WHEEL[button & 3];
+    } else if(motion){
+        label = (button & 3) === 3 ? "Move" : "Drag";
+    } else if(released){
+        label = "Release";
+    } else {
+        label = TERMINAL_MOUSE_BUTTONS[button & 3];
+    }
+    return {label: `${label} ${col},${row}`, motion, hover: motion && (button & 3) === 3};
+};
 const isPrintableTerminalText = (value) => {
     // eslint-disable-next-line no-control-regex
     return value !== "" && !/[\x00-\x1f\x7f]/.test(value) && !value.startsWith("\x1b");
@@ -781,6 +837,8 @@ export const ResponseDisplayInteractive = (props) =>{
     const rawResponsesRef = React.useRef([]);
     const rawPrintableInputBufferRef = React.useRef("");
     const rawPrintableInputTimerRef = React.useRef(null);
+    const mouseInputRef = React.useRef({data: "", labels: [], motionStart: -1});
+    const mouseInputTimerRef = React.useRef(null);
     const lastResizeRef = React.useRef({cols: 0, rows: 0});
     const resizeTimerRef = React.useRef(null);
     const lineInputBufferRef = React.useRef("");
@@ -867,6 +925,10 @@ export const ResponseDisplayInteractive = (props) =>{
             if(rawPrintableInputTimerRef.current !== null){
                 clearTimeout(rawPrintableInputTimerRef.current);
                 rawPrintableInputTimerRef.current = null;
+            }
+            if(mouseInputTimerRef.current !== null){
+                clearTimeout(mouseInputTimerRef.current);
+                mouseInputTimerRef.current = null;
             }
         };
     }, []);
@@ -1242,6 +1304,7 @@ export const ResponseDisplayInteractive = (props) =>{
         originalParams,
         interactiveTaskType=0,
         pendingLabel,
+        showPending=true,
     }) => {
         if(!canSendTerminalInput){
             return;
@@ -1249,7 +1312,9 @@ export const ResponseDisplayInteractive = (props) =>{
         if(interactiveTaskType === 0 && (params === undefined || params === null || params === "")){
             return;
         }
-        addPendingInputEvent(pendingLabel || getTerminalInputLabel(originalParams !== undefined ? originalParams : params));
+        if(showPending){
+            addPendingInputEvent(pendingLabel || getTerminalInputLabel(originalParams !== undefined ? originalParams : params));
+        }
         if(liveConnectionRef.current?.stream.sendInput({
             params: params || "",
             originalParams: originalParams !== undefined ? originalParams : params,
@@ -1288,7 +1353,25 @@ export const ResponseDisplayInteractive = (props) =>{
             pendingLabel: getTerminalInputLabel(terminalData),
         });
     }, [sendInteractiveInput]);
-    const flushRawPrintableInput = React.useCallback( () => {
+    const flushMouseInput = React.useCallback( () => {
+        if(mouseInputTimerRef.current !== null){
+            clearTimeout(mouseInputTimerRef.current);
+            mouseInputTimerRef.current = null;
+        }
+        const {data, labels} = mouseInputRef.current;
+        // hovering doesn't do anything, so it isn't saved with the input
+        const actions = labels.filter((report) => !report.hover).map((report) => report.label);
+        mouseInputRef.current = {data: "", labels: [], motionStart: -1};
+        if(data.length > 0){
+            sendInteractiveInput({
+                params: data,
+                originalParams: actions.join(" "),
+                interactiveTaskType: 0,
+                showPending: false,
+            });
+        }
+    }, [sendInteractiveInput]);
+    const flushRawTextInput = React.useCallback( () => {
         if(rawPrintableInputTimerRef.current !== null){
             clearTimeout(rawPrintableInputTimerRef.current);
             rawPrintableInputTimerRef.current = null;
@@ -1304,6 +1387,11 @@ export const ResponseDisplayInteractive = (props) =>{
             });
         }
     }, [sendInteractiveInput]);
+    // typing and the mouse are batched separately, so whichever is waiting goes before anything else is sent
+    const flushRawPrintableInput = React.useCallback( () => {
+        flushMouseInput();
+        flushRawTextInput();
+    }, [flushMouseInput, flushRawTextInput]);
     const sendTerminalResize = React.useCallback( (cols, rows) => {
         if(!canSendTerminalInput){
             return;
@@ -1337,6 +1425,7 @@ export const ResponseDisplayInteractive = (props) =>{
     }, []);
     // the first key goes straight away, then keys typed while it's on its way are sent together
     const queueRawPrintableInput = React.useCallback( (terminalData) => {
+        flushMouseInput();
         rawPrintableInputBufferRef.current += terminalData;
         if(rawPrintableInputTimerRef.current !== null){
             return;
@@ -1350,7 +1439,39 @@ export const ResponseDisplayInteractive = (props) =>{
             rawPrintableInputTimerRef.current = setTimeout(sendBatch, RAW_PRINTABLE_BATCH_DELAY_MS);
         };
         sendBatch();
-    }, [flushRawPrintableInput]);
+    }, [flushMouseInput, flushRawPrintableInput]);
+    // mouse reports are sent like keys, the first straight away and the rest in batches, and moving the pointer
+    // only sends where it got to by the time a batch goes
+    const handleTerminalMouse = React.useCallback( (terminalData) => {
+        if(!canSendTerminalInput || inputMode !== "raw"){
+            return;
+        }
+        const report = parseTerminalMouseReport(terminalData);
+        if(!report){
+            return;
+        }
+        flushRawTextInput();
+        const mouseInput = mouseInputRef.current;
+        if(report.motion && mouseInput.motionStart >= 0){
+            mouseInput.data = mouseInput.data.slice(0, mouseInput.motionStart);
+            mouseInput.labels = mouseInput.labels.slice(0, -1);
+        }
+        mouseInput.motionStart = report.motion ? mouseInput.data.length : -1;
+        mouseInput.data += terminalData;
+        mouseInput.labels = [...mouseInput.labels, report];
+        if(mouseInputTimerRef.current !== null){
+            return;
+        }
+        const sendBatch = () => {
+            if(mouseInputRef.current.data.length === 0){
+                mouseInputTimerRef.current = null;
+                return;
+            }
+            flushMouseInput();
+            mouseInputTimerRef.current = setTimeout(sendBatch, RAW_PRINTABLE_BATCH_DELAY_MS);
+        };
+        sendBatch();
+    }, [canSendTerminalInput, flushMouseInput, flushRawTextInput, inputMode]);
     const submitLineInput = React.useCallback( () => {
         const enterValue = EnterOptions[selectedEnterOption]?.value || "";
         const lineValue = lineInputBufferRef.current + enterValue;
@@ -1551,6 +1672,7 @@ export const ResponseDisplayInteractive = (props) =>{
                                               lineInputBuffer={lineInputBuffer}
                                               onTerminalInput={handleTerminalData}
                                               onTerminalKeyEvent={handleTerminalKeyEvent}
+                                              onTerminalMouse={handleTerminalMouse}
                                               onTerminalResize={sendTerminalResize}
                                               onScreenModeChange={setScreenAlternate}
                                               startsInAlternateScreen={startsInAlternateScreen}

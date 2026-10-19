@@ -8,6 +8,7 @@ import {
     formatInteractiveTerminalEntry,
     getInteractiveTerminalAppendIndex,
     joinInteractiveSplitCharacters,
+    parseTerminalMouseReport,
     ResponseDisplayInteractive,
 } from './ResponseDisplayInteractive';
 
@@ -266,6 +267,26 @@ describe("addInteractiveLiveOutput", () => {
         const saved = [{responseID: 2, output: [live("full-screen")], byteLength: 11}];
         expect(addInteractiveLiveOutput([row(2, "")], {startResponseID: 1, saved, pending: []}).map((entry) => entry.response))
             .toEqual([""]);
+    });
+});
+
+describe("parseTerminalMouseReport", () => {
+    test("labels SGR reports", () => {
+        expect(parseTerminalMouseReport("\x1b[<0;12;5M")).toEqual({label: "Click 12,5", motion: false, hover: false});
+        expect(parseTerminalMouseReport("\x1b[<2;12;5M")).toEqual({label: "Right click 12,5", motion: false, hover: false});
+        expect(parseTerminalMouseReport("\x1b[<0;12;5m")).toEqual({label: "Release 12,5", motion: false, hover: false});
+        expect(parseTerminalMouseReport("\x1b[<32;13;5M")).toEqual({label: "Drag 13,5", motion: true, hover: false});
+        expect(parseTerminalMouseReport("\x1b[<35;13;5M")).toEqual({label: "Move 13,5", motion: true, hover: true});
+        expect(parseTerminalMouseReport("\x1b[<65;1;1M")).toEqual({label: "Wheel down 1,1", motion: false, hover: false});
+    });
+    test("labels X10 reports", () => {
+        expect(parseTerminalMouseReport("\x1b[M ,%")).toEqual({label: "Click 12,5", motion: false, hover: false});
+        expect(parseTerminalMouseReport("\x1b[M#,%")).toEqual({label: "Release 12,5", motion: false, hover: false});
+        expect(parseTerminalMouseReport("\x1b[MC,%")).toEqual({label: "Move 12,5", motion: true, hover: true});
+    });
+    test("ignores everything else", () => {
+        expect(parseTerminalMouseReport("\x1b[A")).toBe(null);
+        expect(parseTerminalMouseReport("a")).toBe(null);
     });
 });
 
@@ -645,5 +666,81 @@ describe("ResponseDisplayInteractive", () => {
         expect([global.mockTerminal.cols, global.mockTerminal.rows]).toEqual([80, 20]);
         // while still saying how much fits here
         expect(stream.inputs).toHaveLength(1);
+    });
+
+    test("sends the mouse to an app tracking it, only sending where a drag got to", async () => {
+        const task = {
+            id: 1,
+            response_count: 0,
+            display_id: 1,
+            is_interactive_task: false,
+            callback: {display_id: 1},
+            command: {cmd: "pty"},
+        };
+        // eslint-disable-next-line testing-library/no-unnecessary-act
+        await act(async () => {
+            root.render(<ResponseDisplayInteractive task={task} selectAllOutput={false} />);
+        });
+        const stream = global.mockLiveStreams[global.mockLiveStreams.length - 1];
+        stream.canWrite = true;
+        await act(async () => {
+            stream.handlers.onOpened({responseID: 0, canWrite: true});
+        });
+        await settle();
+        // a full-screen app turns on mouse tracking, which also switches to raw input
+        await act(async () => {
+            stream.handlers.onOutput(1, new Uint8Array(Buffer.from("\x1b[?1049h\x1b[?1002h\x1b[?1006h")));
+        });
+        await settle();
+        stream.inputs.length = 0;
+        await act(async () => {
+            ["\x1b[<0;5;3M", "\x1b[<32;6;3M", "\x1b[<32;7;3M", "\x1b[<32;8;3M", "\x1b[<0;8;3m"]
+                .forEach((report) => global.mockTerminal.input(report, true));
+        });
+        await settle();
+        expect(stream.inputs).toEqual([
+            {params: "\x1b[<0;5;3M", originalParams: "Click 5,3", interactiveTaskType: 0},
+            {params: "\x1b[<32;8;3M\x1b[<0;8;3m", originalParams: "Drag 8,3 Release 8,3", interactiveTaskType: 0},
+        ]);
+        // hovering is sent, but left out of what's saved with the input
+        stream.inputs.length = 0;
+        await act(async () => {
+            global.mockTerminal.input("\x1b[<35;9;3M", true);
+        });
+        await settle();
+        expect(stream.inputs).toEqual([{params: "\x1b[<35;9;3M", originalParams: "", interactiveTaskType: 0}]);
+    });
+
+    test("doesn't send the mouse in line mode", async () => {
+        const task = {
+            id: 1,
+            response_count: 0,
+            display_id: 1,
+            is_interactive_task: false,
+            callback: {display_id: 1},
+            command: {cmd: "pty"},
+        };
+        // eslint-disable-next-line testing-library/no-unnecessary-act
+        await act(async () => {
+            root.render(<ResponseDisplayInteractive task={task} selectAllOutput={false} />);
+        });
+        const stream = global.mockLiveStreams[global.mockLiveStreams.length - 1];
+        stream.canWrite = true;
+        await act(async () => {
+            stream.handlers.onOpened({responseID: 0, canWrite: true});
+        });
+        await settle();
+        // mouse tracking without a full-screen app leaves the terminal in line mode
+        await act(async () => {
+            stream.handlers.onOutput(1, new Uint8Array(Buffer.from("\x1b[?1002h\x1b[?1006h")));
+        });
+        await settle();
+        stream.inputs.length = 0;
+        await act(async () => {
+            global.mockTerminal.input("\x1b[<0;5;3M", true);
+            global.mockTerminal.input("\x1b[<0;5;3m", true);
+        });
+        await settle();
+        expect(stream.inputs).toEqual([]);
     });
 });

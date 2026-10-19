@@ -146,3 +146,25 @@ func TestInteractiveLiveInputIsOnlySavedOnceSent(t *testing.T) {
 		t.Fatalf("saved %q", saved())
 	}
 }
+
+func TestInteractiveLiveInputLeavesOutHover(t *testing.T) {
+	liveTask, viewer, sent, saved := newTestInteractiveLiveInput(t, interactiveLiveDelivery{CallbackID: 3}, nil)
+	for _, input := range []InteractiveLiveInput{
+		{OperatorID: 2, MessageType: InteractiveTask.Input, Params: "\x1b[<35;4;2M\x1b[<35;5;2M"},
+		{OperatorID: 2, MessageType: InteractiveTask.Input, Params: "\x1b[<35;5;3M\x1b[<0;5;3M", OriginalParams: "Click 5,3"},
+		{OperatorID: 2, MessageType: InteractiveTask.Input, Params: "\x1b[<32;6;3M\x1b[<0;6;3m\x1b[MC%%", OriginalParams: "Drag 6,3 Release 6,3"},
+		typed("\r"),
+	} {
+		if err := SendInteractiveInput(liveTask.task.ID, viewer, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the agent still gets the pointer moving
+	if got := sent(); len(got) != 4 || got[0] != "parent-uuid 0:\x1b[<35;4;2M\x1b[<35;5;2M" {
+		t.Fatalf("sent = %q", got)
+	}
+	want := []string{"2 0:\x1b[<0;5;3M\x1b[<32;6;3M\x1b[<0;6;3m\r (<Click 5,3><Drag 6,3 Release 6,3>\r) parent 1 completed true"}
+	if got := saved(); !slices.Equal(got, want) {
+		t.Fatalf("saved = %q", got)
+	}
+}
