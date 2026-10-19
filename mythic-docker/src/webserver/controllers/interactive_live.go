@@ -313,7 +313,8 @@ func applyInteractiveLiveResize(owner rabbitmq.InteractiveLiveViewer, size rabbi
 	}
 }
 
-// createInput tasks input the same way as the createTask mutation, just without the trip through GraphQL
+// createInput sends input straight to the agent when it can, and otherwise tasks it the same way as the createTask
+// mutation, just without the trip through GraphQL
 func (task interactiveLiveTask) createInput(stream *interactiveLiveStream, interactiveTaskType int, params string, originalParams string) error {
 	connection := stream.connection
 	if !connection.canWrite {
@@ -327,6 +328,25 @@ func (task interactiveLiveTask) createInput(stream *interactiveLiveStream, inter
 	if err != nil || !operatorOperation.CurrentOperator.Active || operatorOperation.CurrentOperator.Deleted ||
 		!interactiveLiveCanWrite(operatorOperation) || operatorOperation.CurrentOperation.ID != task.OperationID {
 		return errors.New("Not allowed to send input to this task")
+	}
+	var disabledCommandID *int
+	if operatorOperation.BaseDisabledCommandsID.Valid {
+		baseDisabledCommandsID := int(operatorOperation.BaseDisabledCommandsID.Int64)
+		disabledCommandID = &baseDisabledCommandsID
+	}
+	if connection.claims.EventStepInstanceID == 0 {
+		err = rabbitmq.SendInteractiveInput(task.ID, stream, rabbitmq.InteractiveLiveInput{
+			OperatorID:        operatorOperation.CurrentOperator.ID,
+			IsOperatorAdmin:   operatorOperation.CurrentOperator.Admin,
+			DisabledCommandID: disabledCommandID,
+			MessageType:       InteractiveTask.MessageType(interactiveTaskType),
+			Params:            params,
+			OriginalParams:    originalParams,
+			APITokensID:       connection.claims.APITokensID,
+		})
+		if !errors.Is(err, rabbitmq.ErrInteractiveInputNeedsTasking) {
+			return err
+		}
 	}
 	taskingLocation := "command_line"
 	parameterGroupName := "default"
@@ -351,10 +371,7 @@ func (task interactiveLiveTask) createInput(stream *interactiveLiveStream, inter
 		ResolveTaskReferences: &resolveTaskReferences,
 		AuthContext:           authContext,
 	}
-	if operatorOperation.BaseDisabledCommandsID.Valid {
-		baseDisabledCommandsID := int(operatorOperation.BaseDisabledCommandsID.Int64)
-		createTaskInput.DisabledCommandID = &baseDisabledCommandsID
-	}
+	createTaskInput.DisabledCommandID = disabledCommandID
 	if response := rabbitmq.CreateTask(createTaskInput); response.Status == "error" {
 		return errors.New(response.Error)
 	}

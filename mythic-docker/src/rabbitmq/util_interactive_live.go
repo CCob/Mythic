@@ -54,6 +54,10 @@ type interactiveLiveTask struct {
 	size  InteractiveLiveSize
 	// resizes reach the agent one at a time, so it ends up the size worked out last
 	resizeLock sync.Mutex
+	// input sent to the agent and waiting to be saved, for each viewer that sent it
+	inputLock sync.Mutex
+	delivery  *interactiveLiveDelivery
+	inputs    map[InteractiveLiveViewer]*interactiveLiveInputBatch
 }
 
 var interactiveLiveTasks = struct {
@@ -233,6 +237,9 @@ func UnwatchInteractiveTask(taskID int, viewer InteractiveLiveViewer) {
 	liveTask.Lock()
 	delete(liveTask.viewers, viewer)
 	liveTask.Unlock()
+	liveTask.inputLock.Lock()
+	liveTask.saveInput(viewer)
+	liveTask.inputLock.Unlock()
 }
 
 // ResizeInteractiveTask records the size a viewer's terminal can show, or forgets it when size is nil, such as
@@ -295,7 +302,7 @@ func (liveTask *interactiveLiveTask) setViewerSize(viewer InteractiveLiveViewer,
 	return owner, newSize, true
 }
 
-// saveInteractiveLiveTask saves any output still pending for the task, such as when its session ends
+// saveInteractiveLiveTask saves any input and output still pending for the task, such as when its session ends
 func saveInteractiveLiveTask(taskID int) {
 	interactiveLiveTasks.Lock()
 	liveTask, ok := interactiveLiveTasks.tasks[taskID]
@@ -303,9 +310,25 @@ func saveInteractiveLiveTask(taskID int) {
 	if !ok {
 		return
 	}
+	liveTask.inputLock.Lock()
+	liveTask.saveAllInput()
+	liveTask.inputLock.Unlock()
 	liveTask.Lock()
 	liveTask.save()
 	liveTask.Unlock()
+}
+
+// SaveInteractiveLiveTasks saves the input and output still pending for every task, such as when Mythic stops
+func SaveInteractiveLiveTasks() {
+	interactiveLiveTasks.Lock()
+	taskIDs := make([]int, 0, len(interactiveLiveTasks.tasks))
+	for taskID := range interactiveLiveTasks.tasks {
+		taskIDs = append(taskIDs, taskID)
+	}
+	interactiveLiveTasks.Unlock()
+	for _, taskID := range taskIDs {
+		saveInteractiveLiveTask(taskID)
+	}
 }
 
 // forgetIdleInteractiveLiveTasks drops tasks nobody is watching that haven't had output for a while
